@@ -1,8 +1,10 @@
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, Fragment, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   Bot,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   FileText,
   ListChecks,
   MessageSquareText,
@@ -14,6 +16,7 @@ import {
   Sparkles,
   Square,
   Wand2,
+  Wrench,
 } from "lucide-react";
 import { api } from "../api/client";
 import ActaBadge from "../components/ActaBadge";
@@ -26,6 +29,7 @@ export default function InterviewSessionPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [toolsOpen, setToolsOpen] = useState(false);
   const [speaker, setSpeaker] = useState<Speaker>("sme");
   const [transcriptText, setTranscriptText] = useState("");
   const [chatMessage, setChatMessage] = useState("");
@@ -69,7 +73,11 @@ export default function InterviewSessionPage() {
     setIsLoading(true);
     setError(null);
     try {
-      setSession(await api.getSession(id));
+      const loaded = await api.getSession(id);
+      setSession(loaded);
+      if (loaded.chatMessages.length === 0) {
+        await runAction("welcome", () => api.requestWelcome(id));
+      }
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Unable to load session");
     } finally {
@@ -283,8 +291,8 @@ export default function InterviewSessionPage() {
             <button
               className="secondary-action"
               type="button"
-              onClick={() => void sendQuickChat("Mic On")}
-              disabled={busy === "chat" || session.status === "in_progress"}
+              onClick={() => void runAction("start", () => api.startSession(session.id))}
+              disabled={busy === "start" || session.status === "in_progress"}
             >
               <Mic size={16} />
               Mic On
@@ -304,6 +312,18 @@ export default function InterviewSessionPage() {
         </div>
       </section>
 
+      <button
+        className="secondary-action inline-action tools-toggle"
+        type="button"
+        onClick={() => setToolsOpen((open) => !open)}
+      >
+        <Wrench size={16} />
+        {toolsOpen ? "Hide Interview Tools" : "Show Interview Tools"}
+        {toolsOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+      </button>
+
+      {toolsOpen && (
+        <>
       <section className="workspace-grid">
         <div className="panel question-panel">
           <div className="section-heading compact">
@@ -315,11 +335,11 @@ export default function InterviewSessionPage() {
               <button
                 className="primary-action"
                 type="button"
-                onClick={() => void sendQuickChat(checklistShown ? "Yes proceed" : "Proceed")}
-                disabled={busy === "chat"}
+                onClick={() => void runAction("generate", () => api.generateStarterQuestions(session.id))}
+                disabled={busy === "generate"}
               >
                 <Wand2 size={18} />
-                {busy === "chat" ? "Working..." : checklistShown ? "Generate 15" : "Start Setup"}
+                {busy === "generate" ? "Working..." : "Generate Starter Questions"}
               </button>
             ) : (
               <button
@@ -549,11 +569,11 @@ export default function InterviewSessionPage() {
             <button
               className="primary-action"
               type="button"
-              disabled={session.status === "ended" || busy === "chat"}
-              onClick={() => void sendQuickChat("End")}
+              disabled={session.status === "ended" || busy === "end"}
+              onClick={() => void runAction("end", () => api.endSession(session.id))}
             >
               <FileText size={18} />
-              {busy === "chat" ? "Generating..." : "End & Summarize"}
+              {busy === "end" ? "Generating..." : "End & Summarize"}
             </button>
             <button
               className="secondary-action"
@@ -589,15 +609,34 @@ export default function InterviewSessionPage() {
           </div>
         )}
       </section>
+        </>
+      )}
     </section>
   );
+}
+
+interface ListItem {
+  text: string;
+  children: ListBlock[];
+}
+
+interface ListBlock {
+  type: "list";
+  ordered: boolean;
+  start: number;
+  items: ListItem[];
 }
 
 type RichBlock =
   | { type: "heading"; text: string; depth: number }
   | { type: "paragraph"; text: string }
-  | { type: "list"; items: string[]; ordered: boolean }
+  | { type: "rule" }
+  | ListBlock
   | { type: "table"; rows: string[][] };
+
+const HEADING = /^(#{1,4})\s+(.+)$/;
+const LIST_ITEM = /^(\s*)([-*]|\d+\.)\s+(.*)$/;
+const HORIZONTAL_RULE = /^(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$/;
 
 function RichChatContent({ content }: { content: string }) {
   const blocks = useMemo(() => parseRichBlocks(content), [content]);
@@ -606,19 +645,16 @@ function RichChatContent({ content }: { content: string }) {
     <div className="rich-chat-content">
       {blocks.map((block, index) => {
         if (block.type === "heading") {
-          const HeadingTag = block.depth >= 2 ? "h3" : "h2";
+          const HeadingTag = block.depth <= 1 ? "h2" : block.depth === 2 ? "h3" : "h4";
           return <HeadingTag key={`${block.type}-${index}`}>{renderInline(block.text)}</HeadingTag>;
         }
 
+        if (block.type === "rule") {
+          return <hr key={`${block.type}-${index}`} />;
+        }
+
         if (block.type === "list") {
-          const ListTag = block.ordered ? "ol" : "ul";
-          return (
-            <ListTag key={`${block.type}-${index}`}>
-              {block.items.map((item) => (
-                <li key={item}>{renderInline(item)}</li>
-              ))}
-            </ListTag>
-          );
+          return <RichList key={`${block.type}-${index}`} list={block} />;
         }
 
         if (block.type === "table") {
@@ -630,7 +666,7 @@ function RichChatContent({ content }: { content: string }) {
                   <thead>
                     <tr>
                       {header.map((cell) => (
-                        <th key={cell}>{renderInline(cell)}</th>
+                        <th key={cell}>{renderCell(cell)}</th>
                       ))}
                     </tr>
                   </thead>
@@ -639,7 +675,7 @@ function RichChatContent({ content }: { content: string }) {
                   {body.map((row, rowIndex) => (
                     <tr key={`${row.join("-")}-${rowIndex}`}>
                       {row.map((cell, cellIndex) => (
-                        <td key={`${cell}-${cellIndex}`}>{renderInline(cell)}</td>
+                        <td key={`${cell}-${cellIndex}`}>{renderCell(cell)}</td>
                       ))}
                     </tr>
                   ))}
@@ -655,8 +691,22 @@ function RichChatContent({ content }: { content: string }) {
   );
 }
 
+function RichList({ list }: { list: ListBlock }) {
+  const items = list.items.map((item, index) => (
+    <li key={index}>
+      {renderInline(item.text)}
+      {item.children.map((child, childIndex) => (
+        <RichList key={childIndex} list={child} />
+      ))}
+    </li>
+  ));
+
+  return list.ordered ? <ol start={list.start}>{items}</ol> : <ul>{items}</ul>;
+}
+
 function parseRichBlocks(content: string): RichBlock[] {
-  const lines = content.split(/\r?\n/);
+  // HTML comments carry the model's hidden working notes (e.g. HIDDEN_ANALYSIS) and must never render.
+  const lines = content.replace(/<!--[\s\S]*?-->/g, "").split(/\r?\n/);
   const blocks: RichBlock[] = [];
   let index = 0;
 
@@ -667,7 +717,13 @@ function parseRichBlocks(content: string): RichBlock[] {
       continue;
     }
 
-    const heading = /^(#{1,4})\s+(.+)$/.exec(line);
+    if (HORIZONTAL_RULE.test(line)) {
+      blocks.push({ type: "rule" });
+      index += 1;
+      continue;
+    }
+
+    const heading = HEADING.exec(line);
     if (heading) {
       blocks.push({ type: "heading", depth: heading[1].length, text: heading[2] });
       index += 1;
@@ -685,26 +741,17 @@ function parseRichBlocks(content: string): RichBlock[] {
       continue;
     }
 
-    const listMatch = /^([-*]|\d+\.)\s+(.+)$/.exec(line);
-    if (listMatch) {
-      const ordered = /^\d+\.$/.test(listMatch[1]);
-      const items: string[] = [];
-      while (index < lines.length) {
-        const itemMatch = /^([-*]|\d+\.)\s+(.+)$/.exec(lines[index].trim());
-        if (!itemMatch || /^\d+\.$/.test(itemMatch[1]) !== ordered) {
-          break;
-        }
-        items.push(itemMatch[2]);
-        index += 1;
-      }
-      blocks.push({ type: "list", items, ordered });
+    if (LIST_ITEM.test(lines[index])) {
+      const list = parseList(lines, index);
+      blocks.push(list.block);
+      index = list.next;
       continue;
     }
 
     const paragraphLines: string[] = [];
     while (index < lines.length) {
       const current = lines[index].trim();
-      if (!current || /^#{1,4}\s+/.test(current) || isTableLine(current) || /^([-*]|\d+\.)\s+/.test(current)) {
+      if (!current || startsBlock(current) || LIST_ITEM.test(current)) {
         break;
       }
       paragraphLines.push(current);
@@ -716,6 +763,93 @@ function parseRichBlocks(content: string): RichBlock[] {
   return blocks;
 }
 
+interface OpenList {
+  indent: number;
+  list: ListBlock;
+  parent: ListItem | null;
+}
+
+// Nesting follows indentation; blank lines only continue the list when the next item still belongs to it.
+function parseList(lines: string[], start: number): { block: ListBlock; next: number } {
+  const open: OpenList[] = [];
+  let index = start;
+
+  while (index < lines.length) {
+    const match = LIST_ITEM.exec(lines[index]);
+
+    if (!match) {
+      const text = lines[index].trim();
+      if (text) {
+        const lastItem = open[open.length - 1].list.items.at(-1);
+        if (!lastItem || !/^\s{2,}/.test(lines[index]) || startsBlock(text)) {
+          break;
+        }
+        lastItem.text += ` ${text}`;
+        index += 1;
+        continue;
+      }
+
+      let next = index + 1;
+      while (next < lines.length && !lines[next].trim()) {
+        next += 1;
+      }
+      const upcoming = next < lines.length ? LIST_ITEM.exec(lines[next]) : null;
+      const root = open[0];
+      if (!upcoming || (listIndent(upcoming) <= root.indent && isOrderedMarker(upcoming[2]) !== root.list.ordered)) {
+        break;
+      }
+      index = next;
+      continue;
+    }
+
+    const indent = listIndent(match);
+    const ordered = isOrderedMarker(match[2]);
+
+    if (open.length === 0) {
+      open.push({ indent, list: newList(ordered, match[2]), parent: null });
+    } else {
+      while (open.length > 1 && indent < open[open.length - 1].indent) {
+        open.pop();
+      }
+      const top = open[open.length - 1];
+      if (indent > top.indent) {
+        const parent = top.list.items[top.list.items.length - 1];
+        const child = newList(ordered, match[2]);
+        parent.children.push(child);
+        open.push({ indent, list: child, parent });
+      } else if (top.list.ordered !== ordered) {
+        if (!top.parent) {
+          break;
+        }
+        const sibling = newList(ordered, match[2]);
+        top.parent.children.push(sibling);
+        open[open.length - 1] = { indent, list: sibling, parent: top.parent };
+      }
+    }
+
+    open[open.length - 1].list.items.push({ text: match[3], children: [] });
+    index += 1;
+  }
+
+  return { block: open[0].list, next: index };
+}
+
+function newList(ordered: boolean, marker: string): ListBlock {
+  return { type: "list", ordered, start: ordered ? Number.parseInt(marker, 10) : 1, items: [] };
+}
+
+function listIndent(match: RegExpExecArray): number {
+  return match[1].replaceAll("\t", "    ").length;
+}
+
+function isOrderedMarker(marker: string): boolean {
+  return /^\d/.test(marker);
+}
+
+function startsBlock(line: string): boolean {
+  return HORIZONTAL_RULE.test(line) || HEADING.test(line) || isTableLine(line);
+}
+
 function isTableLine(line: string): boolean {
   return line.startsWith("|") && line.endsWith("|");
 }
@@ -723,21 +857,35 @@ function isTableLine(line: string): boolean {
 function splitTableRow(line: string): string[] {
   return line
     .slice(1, -1)
-    .split("|")
-    .map((cell) => cell.trim());
+    .split(/(?<!\\)\|/)
+    .map((cell) => cell.trim().replaceAll("\\|", "|"));
 }
 
-function renderInline(text: string) {
-  return text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).map((part, index) => {
-    if (part.startsWith("`") && part.endsWith("`")) {
-      return <code key={`${part}-${index}`}>{part.slice(1, -1)}</code>;
+function renderCell(text: string) {
+  return text.split(/<br\s*\/?>/i).map((line, index) => (
+    <Fragment key={index}>
+      {index > 0 && <br />}
+      {renderInline(line.trim().replace(/^[-*]\s+/, "• "))}
+    </Fragment>
+  ));
+}
+
+function renderInline(text: string): ReactNode[] {
+  // Captured tokens land at odd indexes: `code`, **bold**, *italic*.
+  return text.split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*\s](?:[^*]*[^*\s])?\*)/g).map((part, index) => {
+    if (index % 2 === 0) {
+      return <span key={index}>{part}</span>;
     }
 
-    if (part.startsWith("**") && part.endsWith("**")) {
-      return <strong key={`${part}-${index}`}>{part.slice(2, -2)}</strong>;
+    if (part.startsWith("`")) {
+      return <code key={index}>{part.slice(1, -1)}</code>;
     }
 
-    return <span key={`${part}-${index}`}>{part}</span>;
+    if (part.startsWith("**")) {
+      return <strong key={index}>{renderInline(part.slice(2, -2))}</strong>;
+    }
+
+    return <em key={index}>{renderInline(part.slice(1, -1))}</em>;
   });
 }
 

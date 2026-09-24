@@ -49,14 +49,33 @@ export const create = mutation({
       starterQuestions: [],
       transcriptSegments: [],
       followUpSuggestions: [],
+      chatMessages: [],
+    });
+  },
+});
+
+export const addAssistantMessage = mutation({
+  args: {
+    id: v.id("interviewSessions"),
+    content: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.get(args.id);
+    if (!session) {
+      throw new Error("Interview session not found");
+    }
+
+    await ctx.db.patch(args.id, {
       chatMessages: [
+        ...session.chatMessages,
         {
           id: crypto.randomUUID(),
           role: "assistant",
-          content: createInitialWelcome(settingSnapshot),
-          createdAt: now,
+          content: args.content,
+          createdAt: Date.now(),
         },
       ],
+      updatedAt: Date.now(),
     });
   },
 });
@@ -320,30 +339,3 @@ export const addDiagnostic = mutation({
   },
 });
 
-function createInitialWelcome(setting: {
-  interviewerName: string;
-  smeName: string;
-  jobRoleTitle: string;
-  domainIndustry: string;
-  interviewObjective: string;
-}) {
-  return [
-    "# Welcome to Capabara's AI-Assisted Interview Support Agent: The Silent Whisperer",
-    "",
-    "Thank you for using The Silent Whisperer, your off-mic, on-screen assistant for high-impact interviews.",
-    "",
-    "This tool delivers three main benefits:",
-    "1. Tracking interview progress across the ACTA distribution.",
-    "2. Real-time coaching with context-aware follow-up prompts.",
-    "3. Transcript management for review, editing, and final archiving.",
-    "",
-    "## Objective",
-    `Interview with ${setting.smeName}, ${setting.jobRoleTitle} (${setting.domainIndustry}).`,
-    `Goal: ${setting.interviewObjective}`,
-    "",
-    "## Next Step",
-    "I will conduct a pre-interview checklist to summarise the session metadata and extract key domain keywords.",
-    "",
-    "Please type `Proceed` to generate the Pre-Interview Checklist.",
-  ].join("\n");
-}

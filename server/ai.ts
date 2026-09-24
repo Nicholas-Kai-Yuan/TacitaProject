@@ -1,16 +1,13 @@
 import { generateObject, generateText } from "ai";
 import { openai } from "@ai-sdk/openai";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import {
-  compactText,
-  generateFallbackFollowUps,
-  generateFallbackRefinedTranscript,
-  generateFallbackStarterQuestions,
-  generateFallbackSummary,
-  getQuestionDistribution,
-} from "../shared/acta";
+import { getQuestionDistribution, parseActaRatio } from "../shared/acta";
 import type {
   ActaLevel,
+  ChatMessage,
   FollowUpSuggestion,
   InterviewSession,
   InterviewSetting,
@@ -18,6 +15,12 @@ import type {
   RefinedTranscriptBlock,
   StarterQuestion,
 } from "../shared/types";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const AGENT_SYSTEM_PROMPT = readFileSync(
+  path.join(__dirname, "prompts", "silent-whisperer.md"),
+  "utf-8",
+);
 
 const questionSchema = z.object({
   text: z.string().min(1),
@@ -56,373 +59,577 @@ const refinedTranscriptSchema = z.object({
   ),
 });
 
-const checklistSchema = z.object({
-  domainKeywords: z.array(z.string().min(1)).min(3).max(7),
-  expectedThemes: z.array(z.string().min(1)).min(5).max(5),
+export function describeAiError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function requireOpenAiKey(): void {
+  if (!process.env.OPENAI_API_KEY?.trim()) {
+    throw new Error("OPENAI_API_KEY is not configured on the server.");
+  }
+}
+
+function getModel(): string {
+  return process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
+}
+
+function buildSystemPrompt(setting: InterviewSetting): string {
+  const fields: Record<string, string> = {
+    field1: setting.interviewerName,
+    field2: setting.smeName,
+    field3: setting.jobRoleTitle,
+    field4: setting.domainIndustry,
+    field5: setting.jobDescription,
+    field6: setting.interviewObjective,
+    field7: setting.keyFocusAreas,
+    field8: setting.actaRatio,
+  };
+
+  return AGENT_SYSTEM_PROMPT.split("\n")
+    .map((line) => {
+      const inTableRow = line.trimStart().startsWith("|");
+      return line.replace(/\{(field[1-8])\}/g, (_match, key: string) =>
+        inTableRow ? toTableCell(fields[key]) : fields[key],
+      );
+    })
+    .join("\n");
+}
+
+const LIST_BULLET = /^(?:[-*•·]\s+|[-•·](?=\D))/;
+const NUMBERED_ITEM = /^\d+[.)]\s/;
+
+// Raw newlines would split a markdown table row, so list lines become "• item" entries and wrapped lines rejoin.
+function toTableCell(value: string): string {
+  const entries: string[] = [];
+  let canContinue = false;
+
+  for (const rawLine of value.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) {
+      canContinue = false;
+      continue;
+    }
+
+    const bullet = LIST_BULLET.exec(line);
+    if (bullet) {
+      entries.push(`• ${line.slice(bullet[0].length)}`);
+    } else if (canContinue && !NUMBERED_ITEM.test(line)) {
+      entries[entries.length - 1] += ` ${line}`;
+    } else {
+      entries.push(line);
+    }
+    canContinue = true;
+  }
+
+  return entries.join("<br>").replaceAll("|", "\\|");
+}
+
+export async function generateWelcomeReply(setting: InterviewSetting): Promise<string> {
+  requireOpenAiKey();
+
+  const result = await generateText({
+    model: openai(getModel()),
+    system: buildSystemPrompt(setting),
+    prompt: "Begin the session now, following your Session Start Instruction exactly.",
+  });
+
+  return result.text;
+}
+
+export async function generateChatReply(
+  setting: InterviewSetting,
+  history: ChatMessage[],
+  userMessage: string,
+): Promise<string> {
+  requireOpenAiKey();
+
+  const result = await generateText({
+    model: openai(getModel()),
+    system: buildSystemPrompt(setting),
+    messages: [
+      ...toModelMessages(history),
+      { role: "user", content: withSentStamp(userMessage, Date.now()) } as const,
+    ],
+  });
+
+  return enforceQuestionQueue(result.text, history, userMessage);
+}
+
+const END_COMMAND = /^(?:end|done)(?:\s+(?:the\s+)?(?:interview|session))?[\s.!]*$/i;
+
+export function isEndCommand(message: string): boolean {
+  return END_COMMAND.test(message.trim());
+}
+
+const interviewSummarySchema = z.object({
+  questionLog: z
+    .array(
+      z.object({
+        messageNumber: z.number().int().describe("Number of the interviewer message that contains the question"),
+        questionText: z.string().min(1).describe("The question in the interviewer's own words"),
+        actaLevel: z.enum(["L1", "L2", "L3"]),
+      }),
+    )
+    .describe("Every question the interviewer asked that the SME answered; one message can contain several questions"),
+  macroSteps: z.array(z.string()).describe("Major steps or phases of the work the SME described, typically 3-6"),
+  cognitiveHotspots: z
+    .array(z.string())
+    .describe("Steps or situations the SME said need the most judgement, experience, or problem-solving"),
+  tacitExpertCategories: z
+    .array(
+      z.object({
+        category: z.string().min(1).describe("Knowledge Audit category name, combining overlapping categories"),
+        points: z
+          .array(z.string())
+          .describe("Specific cues, strategies, rules of thumb, workarounds, or anomalies the SME described"),
+      }),
+    )
+    .describe("One entry per Knowledge Audit category the SME's answers covered; never empty when any L2 question was answered"),
+  scenario: z.object({
+    contextType: z.enum(["Real Incident", "Role-Specific Scenario"]),
+    context: z.array(z.string()).describe("The scenario presented or the real incident the SME recalled"),
+    majorEventsAndDecisionPoints: z.array(z.string()),
+    situationAssessmentAndCriticalCues: z.array(z.string()),
+    actionsTaken: z.array(z.string()),
+    potentialNoviceErrors: z.array(z.string()),
+  }),
+  unresolvedCognitiveGaps: z
+    .array(z.string())
+    .describe("Reasoning the SME could not fully articulate, topics worth probing further, and focus areas or ACTA levels left uncovered"),
 });
 
-const ACTA_CONTEXT = [
-  "Applied Cognitive Task Analysis (ACTA) uses three interview layers:",
-  "L1 Task Diagram: map the work into 3 to 6 broad steps and identify cognitive hotspots.",
-  "L2 Knowledge Audit: probe cues, diagnosing/predicting, big picture, noticing, job smarts, improvising, metacognition, anomalies, and tool limitations.",
-  "L3 Simulation Interview: use difficult incidents or realistic scenarios to surface decision points, cues, trade-offs, novice errors, and expert reasoning.",
-  "The final output should preserve questions, answers, follow-ups, transcript evidence, and a knowledge handover summary.",
-].join("\n");
+type InterviewSummaryData = z.infer<typeof interviewSummarySchema>;
 
-export function createInitialWelcome(setting: InterviewSetting): string {
-  return [
-    "# Welcome to Capabara's AI-Assisted Interview Support Agent: The Silent Whisperer",
-    "",
-    "Thank you for using The Silent Whisperer, your off-mic, on-screen assistant for high-impact interviews.",
-    "",
-    "This tool delivers three main benefits:",
-    "1. Tracking interview progress across the ACTA distribution.",
-    "2. Real-time coaching with context-aware follow-up prompts.",
-    "3. Transcript management for review, editing, and final archiving.",
-    "",
-    "## Objective",
-    `Interview with ${setting.smeName}, ${setting.jobRoleTitle} (${setting.domainIndustry}).`,
-    `Goal: ${setting.interviewObjective}`,
-    "",
-    "## Next Step",
-    "I will conduct a pre-interview checklist to summarise the session metadata and extract key domain keywords.",
-    "",
-    "Please type `Proceed` to generate the Pre-Interview Checklist.",
-  ].join("\n");
+// The model supplies the content; the inventory maths and layout are done here so counts always match the log.
+export async function generateInterviewSummaryReply(
+  setting: InterviewSetting,
+  history: ChatMessage[],
+): Promise<string> {
+  requireOpenAiKey();
+
+  const interviewerMessages = history.filter((message) => message.role === "user");
+  const result = await generateObject({
+    model: openai(getModel()),
+    schema: interviewSummarySchema,
+    system: buildSystemPrompt(setting),
+    messages: [
+      ...toModelMessages(history),
+      {
+        role: "user",
+        content: [
+          "The interviewer has ended the interview. Compile the Phase B End of Interview Summary data from the whole conversation, following the Phase B rules in your instructions.",
+          "For the question log, go through the numbered interviewer messages below one at a time and record every question asked in each message that the SME answered, citing the message number. A message often contains several question-and-answer pairs; record each question separately. Skip messages that are only commands.",
+          ...interviewerMessages.map((message, index) => `[Message ${index + 1}]\n${message.content}`),
+        ].join("\n\n"),
+      },
+    ],
+  });
+
+  return renderInterviewSummary(setting, interviewerMessages, history, result.object);
 }
 
-export async function createPreInterviewChecklistReply(setting: InterviewSetting): Promise<string> {
-  const checklist = await createChecklistData(setting);
+const ACTA_TAGS: Record<ActaLevel, string> = {
+  L1: "[ L1: TASK DIAGRAM ]",
+  L2: "[ L2: KNOWLEDGE AUDIT ]",
+  L3: "[ L3: SIMULATION ]",
+};
+
+function renderInterviewSummary(
+  setting: InterviewSetting,
+  interviewerMessages: ChatMessage[],
+  history: ChatMessage[],
+  summary: InterviewSummaryData,
+): string {
+  const ratio = parseActaRatio(setting.actaRatio) ?? { L1: 20, L2: 60, L3: 20 };
+  const targetCounts = getQuestionDistribution(setting.actaRatio);
+  const queueRows = referenceQueue(history);
+  const followUps = suggestedFollowUps(history.filter((message) => message.role === "assistant"));
+  const log = [...summary.questionLog]
+    .sort((a, b) => a.messageNumber - b.messageNumber)
+    .map((question) => ({ ...question, ...classifyQuestion(question.questionText, question.actaLevel, queueRows, followUps) }));
+
+  // Target # is the level's share of the 15-question funnel (e.g. 60% of 15 = 9 L2 questions).
+  const inventoryRows = (Object.keys(ACTA_TAGS) as ActaLevel[]).map((level) => {
+    const count = log.filter((question) => question.level === level).length;
+    const target = targetCounts[level];
+    return `| \`${ACTA_TAGS[level]}\` | ${ratio[level]}% | ${count} / ${target} | ${inventoryStatus(count, target)} |`;
+  });
+
+  const logRows = log.map((question) => {
+    const sourceMessage = interviewerMessages[question.messageNumber - 1];
+    const time = sourceMessage ? formatGmt8(sourceMessage.createdAt).slice(-5) : "N/A";
+    return `| ${time} | ${question.type} | ${toTableCell(question.questionText)} | \`[${question.level}]\` |`;
+  });
+
+  const { scenario } = summary;
+  const tacitExpert = summary.tacitExpertCategories.length
+    ? summary.tacitExpertCategories.map(({ category, points }) => labelledList(category, points))
+    : [bulletList([])];
 
   return [
-    "## Pre-Interview Checklist",
-    "",
-    "| Field | Current Configuration |",
-    "| :--- | :--- |",
-    `| Objective and Context | ${escapeTableCell(setting.interviewObjective)} |`,
-    `| Subject and Topics | ${escapeTableCell(setting.keyFocusAreas)} |`,
-    `| Domain Keywords | ${escapeTableCell(checklist.domainKeywords.join(", "))} |`,
-    `| Interviewer | ${escapeTableCell(setting.interviewerName)} |`,
-    `| SME (Interviewee) | ${escapeTableCell(`${setting.smeName}, ${setting.jobRoleTitle}`)} |`,
-    `| ACTA Target Ratio | ${escapeTableCell(renderActaRatio(setting))} |`,
-    "",
-    "### Expected Themes",
-    ...checklist.expectedThemes.map((theme) => `- ${theme}`),
-    "",
-    "I have verified the session metadata and extracted key domain themes.",
-    "Does this look correct? Please confirm to generate your Starter Questions.",
-  ].join("\n");
+    "## END OF INTERVIEW SUMMARY",
+    "### Final ACTA Inventory",
+    markdownTable(["Level", "Target %", "Actual # / Target #", "Status"], inventoryRows),
+    "---",
+    "### Tacit Knowledge Handover Report",
+    "**1. The Task Map & Hotspots (L1):**",
+    labelledList("Macro Steps", summary.macroSteps),
+    labelledList("Cognitive Hotspots", summary.cognitiveHotspots),
+    "---",
+    "**2. The Tacit Expert (L2):**",
+    ...tacitExpert,
+    "---",
+    "**3. Scenario & Incident Breakdown (L3):**",
+    labelledList(`Context (${scenario.contextType})`, scenario.context),
+    labelledList("Major Events & Decision Points", scenario.majorEventsAndDecisionPoints),
+    labelledList("Situation Assessment & Critical Cues", scenario.situationAssessmentAndCriticalCues),
+    labelledList("Actions Taken", scenario.actionsTaken),
+    labelledList("Potential Errors (Novice Traps)", scenario.potentialNoviceErrors),
+    "---",
+    "### Areas for Future Exploration",
+    labelledList("Unresolved Cognitive Gaps", summary.unresolvedCognitiveGaps),
+    "---",
+    "**✅ Validated Questions Asked (Complete Log)**",
+    markdownTable(
+      ["Timestamp (GMT+8)", "Type (Starter / Follow-up / Off-Script)", "Question Text", "ACTA Level"],
+      logRows.length ? logRows : ["| N/A | - | No validated questions were recorded. | - |"],
+    ),
+    "---",
+    "**Would you like me to generate the Final Refined Transcript & Q&A Chunking?** Type **'Confirm'** to proceed.",
+    "*Depending on the interview length, generating all interaction blocks may take a few more turns.*",
+  ].join("\n\n");
 }
 
-export function createStarterQuestionFlowReply(session: InterviewSession): string {
-  return [
-    "Thank you for your confirmation.",
-    "",
-    renderSessionTracker(session),
-    "",
-    "## Question Queue (The 15-Q Funnel)",
-    "",
-    renderQuestionQueue(session),
-    "",
-    "## Follow-up Tracker (Dynamic)",
-    "",
-    renderFollowUpTracker(session),
-    "",
-    "## Transcription State Management Instructions",
-    "",
-    "- Capture the interviewer question and SME answer in the chat box below.",
-    "- Send each Q&A exchange for AI analysis so I can update the tracker and suggest follow-ups.",
-    "- You may ask your own questions, use the queue, or use a suggested follow-up.",
-    "",
-    "You may type `Mic On` whenever you are ready.",
-    "",
-    "## Next Logical Step",
-    "Begin your interview with Question 1 from the queue to establish context and workflow.",
-  ].join("\n");
+// Classified here rather than by the model, which proved unreliable at recognising its own funnel and suggestions.
+// A starter question keeps the level it was given in the queue so the inventory matches the queue.
+function classifyQuestion(
+  question: string,
+  modelLevel: ActaLevel,
+  queueRows: QueueRow[],
+  followUps: string[],
+): { type: string; level: ActaLevel } {
+  let best: QueueRow | null = null;
+  let bestScore = 0;
+  for (const row of queueRows) {
+    const score = phraseOverlap(row.question, question);
+    if (score > bestScore) {
+      best = row;
+      bestScore = score;
+    }
+  }
+  if (best && bestScore >= ASKED_THRESHOLD) {
+    return { type: "Starter", level: best.level ?? modelLevel };
+  }
+
+  const isFollowUp = followUps.some((suggested) => questionSimilarity(question, suggested) >= 0.5);
+  return { type: isFollowUp ? "Follow-up" : "Off-Script", level: modelLevel };
 }
 
-export function createMicOnReply(session: InterviewSession): string {
-  const activeQuestion = getActiveQuestion(session);
-  return [
-    "Mic On confirmed. The live interview is now in progress.",
-    "",
-    renderSessionTracker(session),
-    "",
-    "## Active Question",
-    activeQuestion
-      ? `Focus: ${activeQuestion.focus}\nACTA Target: ${activeQuestion.actaLevel}\n\n${activeQuestion.text}`
-      : "All starter questions have been covered. Continue with targeted follow-ups or type `End` to close.",
-    "",
-    "Send the captured Q&A exchange after the SME answers so I can update the tracker and recommend the next move.",
-  ].join("\n");
+interface QueueRow {
+  cells: string[];
+  question: string;
+  level: ActaLevel | null;
+}
+
+interface QueueTable {
+  header: string[];
+  rows: QueueRow[];
+}
+
+// The model redraws the "15-Q Funnel" table every turn and, left alone, reshuffles rows, drops answered ones,
+// or swaps in follow-ups. Once the live interview starts (first reply with a SESSION TRACKER) every reply
+// gets the approved queue back, with statuses worked out from the transcripts.
+function enforceQuestionQueue(reply: string, history: ChatMessage[], latestMessage: string): string {
+  const lines = reply.split(/\r?\n/);
+  const range = findQueueTable(lines);
+  const now = Date.now();
+  const messages: ChatMessage[] = [
+    ...history,
+    { id: "latest", role: "user", content: latestMessage, createdAt: now },
+    { id: "reply", role: "assistant", content: reply, createdAt: now },
+  ];
+  const approved = approvedQueue(messages);
+  if (!range || !approved) {
+    return reply;
+  }
+
+  // Every transcript since the approved queue counts, so an answer sent before the first tracker is
+  // included and Done never reverts.
+  const transcripts = messages
+    .slice(approved.index + 1)
+    .filter((message) => message.role === "user")
+    .map((message) => message.content);
+  const activeQuestion = readQueueTable(reply)?.rows.find((row) => /active/i.test(row.cells.at(-1) ?? ""))?.question;
+
+  const rows = approved.table.rows.map((row) => {
+    let status = "Pending";
+    if (transcripts.some((transcript) => phraseOverlap(row.question, transcript) >= ASKED_THRESHOLD)) {
+      status = "Done";
+    } else if (activeQuestion && phraseOverlap(row.question, activeQuestion) >= ASKED_THRESHOLD) {
+      status = "Active";
+    }
+    return `| ${[...row.cells.slice(0, -1), status].join(" | ")} |`;
+  });
+
+  return [...lines.slice(0, range.start), ...approved.table.header, ...rows, ...lines.slice(range.end)].join("\n");
+}
+
+// Null until the live interview has started. The approved queue is the last one shown before the first
+// SESSION TRACKER, or that message's own queue when the model went straight to the live format.
+function approvedQueue(messages: ChatMessage[]): { index: number; table: QueueTable } | null {
+  const liveIndex = messages.findIndex(
+    (message) => message.role === "assistant" && message.content.includes("SESSION TRACKER") && readQueueTable(message.content),
+  );
+  if (liveIndex < 0) {
+    return null;
+  }
+
+  for (let index = liveIndex - 1; index >= 0; index -= 1) {
+    const table = messages[index].role === "assistant" ? readQueueTable(messages[index].content) : null;
+    if (table) {
+      return { index, table };
+    }
+  }
+  const table = readQueueTable(messages[liveIndex].content);
+  return table ? { index: liveIndex, table } : null;
+}
+
+// The approved queue if the interview has started, otherwise the most recent queue shown.
+function referenceQueue(history: ChatMessage[]): QueueRow[] {
+  const approved = approvedQueue(history);
+  if (approved) {
+    return approved.table.rows;
+  }
+  const latest = [...history].reverse().find((message) => message.role === "assistant" && readQueueTable(message.content));
+  return latest ? readQueueTable(latest.content)?.rows ?? [] : [];
+}
+
+function readQueueTable(content: string): QueueTable | null {
+  const lines = content.split(/\r?\n/);
+  const range = findQueueTable(lines);
+  if (!range) {
+    return null;
+  }
+
+  const tableLines = lines.slice(range.start, range.end).map((line) => line.trim());
+  const rows = tableLines
+    .filter((line) => /^\|\s*\d/.test(line))
+    .map(parseQueueRow)
+    .sort((a, b) => Number.parseInt(a.cells[0], 10) - Number.parseInt(b.cells[0], 10));
+  return rows.length ? { header: tableLines.filter((line) => !/^\|\s*\d/.test(line)), rows } : null;
+}
+
+// The table directly under a line mentioning the "15-Q Funnel" (blank lines in between are allowed).
+function findQueueTable(lines: string[]): { start: number; end: number } | null {
+  for (let heading = 0; heading < lines.length; heading += 1) {
+    if (!lines[heading].includes("15-Q Funnel")) {
+      continue;
+    }
+
+    let start = -1;
+    let end = heading + 1;
+    for (; end < lines.length; end += 1) {
+      const line = lines[end].trim();
+      if (line.startsWith("|")) {
+        start = start < 0 ? end : start;
+      } else if (line || start >= 0) {
+        break;
+      }
+    }
+    if (start >= 0) {
+      return { start, end };
+    }
+  }
+  return null;
+}
+
+function parseQueueRow(line: string): QueueRow {
+  const cells = line
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split(/(?<!\\)\|/)
+    .map((cell) => cell.trim());
+  const question = cells.reduce((longest, cell) => (cell.length > longest.length ? cell : longest), "");
+  const level = /\bL([123])\b/.exec(cells.filter((cell) => cell !== question).join(" "))?.[1];
+  return { cells, question, level: level ? (`L${level}` as ActaLevel) : null };
+}
+
+const ASKED_THRESHOLD = 0.5;
+
+// Share of the queued question's consecutive word pairs found in the text. Word pairs survive missing
+// punctuation from speech-to-text, but an answer that merely discusses the same topic rarely repeats them.
+function phraseOverlap(queuedQuestion: string, text: string): number {
+  const questionPairs = new Set(wordPairs(queuedQuestion));
+  if (questionPairs.size === 0) {
+    return 0;
+  }
+  const textPairs = new Set(wordPairs(text));
+  return [...questionPairs].filter((pair) => textPairs.has(pair)).length / questionPairs.size;
+}
+
+function wordPairs(text: string): string[] {
+  const words = text.toLowerCase().match(/[a-z0-9']+/g) ?? [];
+  return words.slice(1).map((word, index) => `${words[index]} ${word}`);
+}
+
+// Follow-up scripts are always presented as quoted questions.
+function suggestedFollowUps(assistantMessages: ChatMessage[]): string[] {
+  return assistantMessages.flatMap((message) =>
+    [...message.content.matchAll(/["“]([^"”\n]{10,})["”]/g)]
+      .map((match) => match[1].trim())
+      .filter((quoted) => quoted.endsWith("?")),
+  );
+}
+
+const STOP_WORDS = new Set([
+  "about", "been", "could", "does", "from", "have", "into", "more", "most", "some", "that", "their",
+  "them", "there", "these", "they", "this", "those", "were", "what", "when", "which", "with", "would", "your",
+]);
+
+// Share of the shorter question's key words found in the other; 0.5 or more is treated as the same question.
+function questionSimilarity(asked: string, reference: string): number {
+  const askedWords = contentWords(asked);
+  const referenceWords = contentWords(reference);
+  const shared = [...askedWords].filter((word) => referenceWords.has(word)).length;
+  return shared >= 2 ? shared / Math.min(askedWords.size, referenceWords.size) : 0;
+}
+
+function contentWords(text: string): Set<string> {
+  return new Set((text.toLowerCase().match(/[a-z]{4,}/g) ?? []).filter((word) => !STOP_WORDS.has(word)));
+}
+
+function inventoryStatus(count: number, target: number): "Under" | "Met" | "Over" {
+  if (count === target) {
+    return "Met";
+  }
+  return count < target ? "Under" : "Over";
+}
+
+function markdownTable(header: string[], rows: string[]): string {
+  return [`| ${header.join(" | ")} |`, `| ${header.map(() => ":---").join(" | ")} |`, ...rows].join("\n");
+}
+
+function labelledList(label: string, items: string[]): string {
+  return `*${label.replaceAll("*", "").trim()}:*\n\n${bulletList(items)}`;
+}
+
+function bulletList(items: string[]): string {
+  const lines = items.map((item) => item.replace(/\s+/g, " ").trim()).filter(Boolean);
+  return lines.length ? lines.map((line) => `- ${line}`).join("\n") : "- Not covered in this interview.";
+}
+
+function toModelMessages(history: ChatMessage[]) {
+  return history.map((message) =>
+    message.role === "user"
+      ? ({ role: "user", content: withSentStamp(message.content, message.createdAt) } as const)
+      : ({ role: "assistant", content: message.content } as const),
+  );
+}
+
+const gmt8Format = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Asia/Singapore",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
+function formatGmt8(timestamp: number): string {
+  const part = Object.fromEntries(gmt8Format.formatToParts(timestamp).map(({ type, value }) => [type, value]));
+  return `${part.year}-${part.month}-${part.day} ${part.hour}:${part.minute}`;
+}
+
+function withSentStamp(content: string, timestamp: number): string {
+  return `[Sent ${formatGmt8(timestamp)} GMT+8]\n${content}`;
 }
 
 export async function createStarterQuestions(setting: InterviewSetting): Promise<StarterQuestion[]> {
+  requireOpenAiKey();
+
   const distribution = getQuestionDistribution(setting.actaRatio);
+  const result = await generateObject({
+    model: openai(getModel()),
+    schema: starterQuestionsSchema,
+    prompt: [
+      "Generate exactly 15 personalized ACTA-aligned starter interview questions.",
+      "Questions must be ordered from L1 to L2 to L3, be specific to the SME, avoid duplicates, and not be yes/no questions.",
+      `Required distribution: L1=${distribution.L1}, L2=${distribution.L2}, L3=${distribution.L3}.`,
+      renderSetting(setting),
+    ].join("\n\n"),
+  });
 
-  if (!hasOpenAiKey()) {
-    return generateFallbackStarterQuestions(setting);
-  }
-
-  try {
-    const result = await generateObject({
-      model: openai(getModel()),
-      schema: starterQuestionsSchema,
-      prompt: [
-        "Generate exactly 15 personalized ACTA-aligned starter interview questions.",
-        "Questions must be ordered from L1 to L2 to L3, be specific to the SME, avoid duplicates, and not be yes/no questions.",
-        `Required distribution: L1=${distribution.L1}, L2=${distribution.L2}, L3=${distribution.L3}.`,
-        renderSetting(setting),
-      ].join("\n\n"),
-    });
-
-    const questions = result.object.questions.map((question) => ({
-      ...question,
-      id: crypto.randomUUID(),
-      status: "planned" as const,
-      source: "starter" as const,
-    }));
-
-    return enforceQuestionDistribution(questions, setting);
-  } catch (error) {
-    console.warn("OpenAI starter question generation failed; using fallback.", error);
-    return generateFallbackStarterQuestions(setting);
-  }
+  return result.object.questions.map((question) => ({
+    ...question,
+    id: crypto.randomUUID(),
+    status: "planned" as const,
+    source: "starter" as const,
+  }));
 }
 
 export async function createFollowUps(session: InterviewSession): Promise<FollowUpSuggestion[]> {
-  if (!hasOpenAiKey()) {
-    return generateFallbackFollowUps(session.settingSnapshot, session.transcriptSegments);
-  }
+  requireOpenAiKey();
 
-  try {
-    const result = await generateObject({
-      model: openai(getModel()),
-      schema: followUpsSchema,
-      prompt: [
-        "Recommend a small set of concise ACTA follow-up questions for a live interviewer.",
-        "Build on the latest SME response, avoid repetition, and favor explanation/storytelling over yes/no wording.",
-        renderSetting(session.settingSnapshot),
-        renderSessionContext(session),
-      ].join("\n\n"),
-    });
+  const result = await generateObject({
+    model: openai(getModel()),
+    schema: followUpsSchema,
+    prompt: [
+      "Recommend a small set of concise ACTA follow-up questions for a live interviewer.",
+      "Build on the latest SME response, avoid repetition, and favor explanation/storytelling over yes/no wording.",
+      renderSetting(session.settingSnapshot),
+      renderSessionContext(session),
+    ].join("\n\n"),
+  });
 
-    return result.object.suggestions.map((suggestion, index) => ({
-      ...suggestion,
-      id: crypto.randomUUID(),
-      createdAt: Date.now() + index,
-      used: false,
-    }));
-  } catch (error) {
-    console.warn("OpenAI follow-up generation failed; using fallback.", error);
-    return generateFallbackFollowUps(session.settingSnapshot, session.transcriptSegments);
-  }
+  return result.object.suggestions.map((suggestion, index) => ({
+    ...suggestion,
+    id: crypto.randomUUID(),
+    createdAt: Date.now() + index,
+    used: false,
+  }));
 }
 
 export async function createSummary(session: InterviewSession): Promise<InterviewSummary> {
-  if (!hasOpenAiKey()) {
-    return generateFallbackSummary(session.settingSnapshot, session.transcriptSegments);
-  }
+  requireOpenAiKey();
 
-  try {
-    const result = await generateObject({
-      model: openai(getModel()),
-      schema: summarySchema,
-      prompt: [
-        "Generate a whole-interview ACTA summary from the complete transcript.",
-        "Cover L1 task map/cognitive hotspots, L2 tacit expert knowledge, L3 scenario/decision findings, and future exploration.",
-        "Do not summarize only the most recent segment.",
-        renderSetting(session.settingSnapshot),
-        renderSessionContext(session),
-      ].join("\n\n"),
-    });
+  const result = await generateObject({
+    model: openai(getModel()),
+    schema: summarySchema,
+    prompt: [
+      "Generate a whole-interview ACTA summary from the complete transcript.",
+      "Cover L1 task map/cognitive hotspots, L2 tacit expert knowledge, L3 scenario/decision findings, and future exploration.",
+      "Do not summarize only the most recent segment.",
+      renderSetting(session.settingSnapshot),
+      renderSessionContext(session),
+    ].join("\n\n"),
+  });
 
-    return {
-      generatedAt: Date.now(),
-      ...result.object,
-    };
-  } catch (error) {
-    console.warn("OpenAI summary generation failed; using fallback.", error);
-    return generateFallbackSummary(session.settingSnapshot, session.transcriptSegments);
-  }
+  return {
+    generatedAt: Date.now(),
+    ...result.object,
+  };
 }
 
 export async function createRefinedTranscript(
   session: InterviewSession,
 ): Promise<RefinedTranscriptBlock[]> {
-  if (!hasOpenAiKey()) {
-    return generateFallbackRefinedTranscript(session.transcriptSegments);
-  }
+  requireOpenAiKey();
 
-  try {
-    const result = await generateObject({
-      model: openai(getModel()),
-      schema: refinedTranscriptSchema,
-      prompt: [
-        "Create a refined speaker-labelled transcript arranged into interviewer-question and SME-response blocks.",
-        "Use only the provided transcript content.",
-        renderSessionContext(session),
-      ].join("\n\n"),
-    });
+  const result = await generateObject({
+    model: openai(getModel()),
+    schema: refinedTranscriptSchema,
+    prompt: [
+      "Create a refined speaker-labelled transcript arranged into interviewer-question and SME-response blocks.",
+      "Use only the provided transcript content.",
+      renderSessionContext(session),
+    ].join("\n\n"),
+  });
 
-    return result.object.blocks.map((block) => ({
-      ...block,
-      id: crypto.randomUUID(),
-    }));
-  } catch (error) {
-    console.warn("OpenAI refined transcript generation failed; using fallback.", error);
-    return generateFallbackRefinedTranscript(session.transcriptSegments);
-  }
-}
-
-export async function createChatReply(
-  session: InterviewSession,
-  message: string,
-): Promise<string> {
-  if (!hasOpenAiKey()) {
-    if (session.starterQuestions.length === 0) {
-      return "I am ready to begin the guided ACTA setup. Type `Proceed` to generate the Pre-Interview Checklist.";
-    }
-
-    const latest = session.transcriptSegments.at(-1)?.text;
-    return [
-      "Based on the current session context, keep the interviewer in control and probe for tacit knowledge.",
-      latest
-        ? `A useful next move is to ask what cues or trade-offs sit behind: "${latest.slice(0, 160)}".`
-        : "Generate or capture transcript content first for more contextual guidance.",
-    ].join(" ");
-  }
-
-  try {
-    const result = await generateText({
-      model: openai(getModel()),
-      prompt: [
-        "You are TACITA, an interviewer-facing ACTA copilot called The Silent Whisperer.",
-        "Answer concisely and only support the human interviewer. Do not pretend to be the SME.",
-        ACTA_CONTEXT,
-        renderSetting(session.settingSnapshot),
-        renderSessionContext(session),
-        `Interviewer asks: ${message}`,
-      ].join("\n\n"),
-    });
-
-    return result.text;
-  } catch (error) {
-    console.warn("OpenAI chat failed; using fallback.", error);
-    return "I could not reach the AI provider, so I would continue by probing for cues, decision points, trade-offs, and what a novice might miss.";
-  }
-}
-
-export async function createLiveInterviewTurnReply(
-  session: InterviewSession,
-  latestInput: string,
-): Promise<string> {
-  const coaching = await createCoachingText(session, latestInput);
-
-  return [
-    renderSessionTracker(session),
-    "",
-    "## Active Question",
-    renderActiveQuestion(session),
-    "",
-    "## Question Queue (The 15-Q Funnel)",
-    "",
-    renderQuestionQueue(session),
-    "",
-    "## Follow-up Tracker (Dynamic)",
-    "",
-    renderFollowUpTracker(session),
-    "",
-    "## AI Coaching",
-    coaching,
-    "",
-    "## Next Logical Step",
-    getNextLogicalStep(session),
-  ].join("\n");
-}
-
-export function createEndInterviewReply(session: InterviewSession, summary: InterviewSummary): string {
-  const asked = session.starterQuestions.filter((question) => question.status === "asked").length;
-
-  return [
-    "Conclusion detected. I have ended the interview and stored the full chat log, starter questions, follow-up suggestions, and captured transcript in Convex.",
-    "",
-    `Questions covered: ${asked} / ${Math.max(session.starterQuestions.length, 15)}.`,
-    "",
-    "## Final Summary",
-    "",
-    "### L1 Task Map and Cognitive Hotspots",
-    ...summary.taskMap.map((item) => `- ${item}`),
-    "",
-    "### L2 Tacit Expert Knowledge",
-    ...summary.tacitKnowledge.map((item) => `- ${item}`),
-    "",
-    "### L3 Scenario / Incident Analysis",
-    ...summary.scenarioFindings.map((item) => `- ${item}`),
-    "",
-    "### Future Exploration",
-    ...summary.futureExploration.map((item) => `- ${item}`),
-  ].join("\n");
-}
-
-export function hasPreInterviewChecklist(session: InterviewSession): boolean {
-  return session.chatMessages.some(
-    (message) => message.role === "assistant" && message.content.includes("Pre-Interview Checklist"),
-  );
-}
-
-export function isProceedCommand(message: string): boolean {
-  return normalizeCommand(message) === "proceed";
-}
-
-export function isConfirmationCommand(message: string): boolean {
-  const normalized = normalizeCommand(message);
-  return [
-    "yes",
-    "yes proceed",
-    "proceed",
-    "confirm",
-    "confirmed",
-    "looks good",
-    "looks correct",
-    "ok proceed",
-    "okay proceed",
-  ].includes(normalized);
-}
-
-export function isStartInterviewCommand(message: string): boolean {
-  const normalized = normalizeCommand(message);
-  return ["mic on", "start", "start interview", "begin", "begin interview"].includes(normalized);
-}
-
-export function isEndInterviewCommand(message: string): boolean {
-  return normalizeCommand(message) === "end";
-}
-
-function enforceQuestionDistribution(
-  questions: StarterQuestion[],
-  setting: InterviewSetting,
-): StarterQuestion[] {
-  const distribution = getQuestionDistribution(setting.actaRatio);
-  const fallback = generateFallbackStarterQuestions(setting);
-  const ordered: StarterQuestion[] = [];
-
-  for (const level of ["L1", "L2", "L3"] as ActaLevel[]) {
-    const selected = questions.filter((question) => question.actaLevel === level);
-    const needed = distribution[level];
-    const filled = [...selected, ...fallback.filter((question) => question.actaLevel === level)]
-      .slice(0, needed)
-      .map((question) => ({
-        ...question,
-        id: crypto.randomUUID(),
-        actaLevel: level,
-        status: "planned" as const,
-        source: "starter" as const,
-      }));
-    ordered.push(...filled);
-  }
-
-  return ordered.slice(0, 15);
+  return result.object.blocks.map((block) => ({
+    ...block,
+    id: crypto.randomUUID(),
+  }));
 }
 
 function renderSetting(setting: InterviewSetting): string {
@@ -436,59 +643,6 @@ function renderSetting(setting: InterviewSetting): string {
     `Key Focus Areas: ${setting.keyFocusAreas}`,
     `ACTA Ratio: ${setting.actaRatio}`,
   ].join("\n");
-}
-
-async function createChecklistData(setting: InterviewSetting): Promise<z.infer<typeof checklistSchema>> {
-  if (!hasOpenAiKey()) {
-    return createFallbackChecklistData(setting);
-  }
-
-  try {
-    const result = await generateObject({
-      model: openai(getModel()),
-      schema: checklistSchema,
-      prompt: [
-        "Create concise pre-interview checklist support data for an ACTA interview.",
-        "Return 5 to 7 domain keywords and exactly 5 expected themes. Use only the provided interview setting.",
-        ACTA_CONTEXT,
-        renderSetting(setting),
-      ].join("\n\n"),
-    });
-
-    return {
-      domainKeywords: result.object.domainKeywords.map(cleanListItem).filter(Boolean).slice(0, 7),
-      expectedThemes: fillToFive(result.object.expectedThemes.map(cleanListItem).filter(Boolean), setting),
-    };
-  } catch (error) {
-    console.warn("OpenAI checklist generation failed; using fallback.", error);
-    return createFallbackChecklistData(setting);
-  }
-}
-
-async function createCoachingText(session: InterviewSession, latestInput: string): Promise<string> {
-  if (!hasOpenAiKey()) {
-    return createFallbackCoachingText(session, latestInput);
-  }
-
-  try {
-    const result = await generateText({
-      model: openai(getModel()),
-      prompt: [
-        "You are TACITA's Silent Whisperer, an off-mic ACTA interview coach.",
-        "Write a concise coaching note for the interviewer. Mention why the latest answer matters, what ACTA layer it supports, and how to probe deeper.",
-        "Keep it under 140 words. Do not repeat the full transcript.",
-        ACTA_CONTEXT,
-        renderSetting(session.settingSnapshot),
-        renderSessionContext(session),
-        `Latest submitted interview content: ${latestInput}`,
-      ].join("\n\n"),
-    });
-
-    return result.text.trim() || createFallbackCoachingText(session, latestInput);
-  } catch (error) {
-    console.warn("OpenAI live coaching failed; using fallback.", error);
-    return createFallbackCoachingText(session, latestInput);
-  }
 }
 
 function renderSessionContext(session: InterviewSession): string {
@@ -511,210 +665,4 @@ function renderSessionContext(session: InterviewSession): string {
     "Recent suggestions:",
     suggestions || "None yet.",
   ].join("\n");
-}
-
-function createFallbackChecklistData(setting: InterviewSetting): z.infer<typeof checklistSchema> {
-  const keywords = uniqueClean([
-    ...splitTextParts(setting.domainIndustry),
-    ...splitTextParts(setting.keyFocusAreas),
-    setting.jobRoleTitle,
-  ]).slice(0, 7);
-
-  const domainKeywords = keywords.length >= 3
-    ? keywords
-    : fillList(keywords, ["Tacit knowledge", "Decision-making", "Expert reasoning"]);
-
-  return {
-    domainKeywords,
-    expectedThemes: fillToFive(
-      uniqueClean([
-        ...splitTextParts(setting.keyFocusAreas),
-        `Cognitive hotspots in ${setting.jobRoleTitle}`,
-        `Decision-making in ${setting.domainIndustry}`,
-        "Tacit cues and expert heuristics",
-        "Novice mistakes and knowledge transfer",
-      ]),
-      setting,
-    ),
-  };
-}
-
-function renderActaRatio(setting: InterviewSetting): string {
-  const distribution = getQuestionDistribution(setting.actaRatio);
-  return `${setting.actaRatio} | L1: ${distribution.L1}, L2: ${distribution.L2}, L3: ${distribution.L3}`;
-}
-
-function renderSessionTracker(session: InterviewSession): string {
-  const target = getQuestionDistribution(session.settingSnapshot.actaRatio);
-  const asked = countAskedByLevel(session);
-  const totalAsked = asked.L1 + asked.L2 + asked.L3;
-
-  return [
-    "## Session Tracker",
-    "",
-    `Questions Asked: ${totalAsked} / 15 | Distribution: L1(${asked.L1}) L2(${asked.L2}) L3(${asked.L3})`,
-    "",
-    "| ACTA Level | Asked | Target | Status |",
-    "| :--- | :--- | :--- | :--- |",
-    ...(["L1", "L2", "L3"] as ActaLevel[]).map((level) => {
-      const status = asked[level] >= target[level] ? "Target met" : "Open";
-      return `| ${level} | ${asked[level]} | ${target[level]} | ${status} |`;
-    }),
-  ].join("\n");
-}
-
-function renderQuestionQueue(session: InterviewSession): string {
-  if (session.starterQuestions.length === 0) {
-    return "No starter questions have been generated yet.";
-  }
-
-  return [
-    "| # | Focus | Question Text / Topic | ACTA Target | Status |",
-    "| :--- | :--- | :--- | :--- | :--- |",
-    ...session.starterQuestions.slice(0, 15).map((question, index) =>
-      `| ${index + 1} | ${escapeTableCell(question.focus)} | ${escapeTableCell(question.text)} | ${question.actaLevel} | ${toTitle(question.status)} |`,
-    ),
-  ].join("\n");
-}
-
-function renderFollowUpTracker(session: InterviewSession): string {
-  const visibleSuggestions = session.followUpSuggestions.slice(0, 5);
-
-  if (visibleSuggestions.length === 0) {
-    return [
-      "| Ref | Suggested Follow-up | ACTA Level | Status |",
-      "| :--- | :--- | :--- | :--- |",
-      "| - | No follow-ups yet. Start the interview to receive real-time guidance. | - | - |",
-    ].join("\n");
-  }
-
-  return [
-    "| Ref | Suggested Follow-up | ACTA Level | Status |",
-    "| :--- | :--- | :--- | :--- |",
-    ...visibleSuggestions.map((suggestion) =>
-      `| NEW | ${escapeTableCell(`[${suggestion.focus}] ${suggestion.text}`)} | ${suggestion.actaLevel} | ${suggestion.used ? "Used" : "Suggested"} |`,
-    ),
-  ].join("\n");
-}
-
-function renderActiveQuestion(session: InterviewSession): string {
-  const activeQuestion = getActiveQuestion(session);
-  if (!activeQuestion) {
-    return "All starter questions are marked as covered. Use a follow-up suggestion or type `End` to close the session.";
-  }
-
-  return [
-    `Focus: ${activeQuestion.focus}`,
-    `ACTA Target: ${activeQuestion.actaLevel}`,
-    "",
-    activeQuestion.text,
-  ].join("\n");
-}
-
-function getActiveQuestion(session: InterviewSession): StarterQuestion | undefined {
-  return session.starterQuestions.find((question) => question.status === "planned");
-}
-
-function getNextLogicalStep(session: InterviewSession): string {
-  const activeQuestion = getActiveQuestion(session);
-  if (activeQuestion) {
-    const index = session.starterQuestions.findIndex((question) => question.id === activeQuestion.id) + 1;
-    return `You may proceed to Question ${index} or select one of the follow-ups above if the SME's answer needs more depth.`;
-  }
-
-  return "All starter questions have been covered. Ask a final meta-reflection question, then type `End` when ready.";
-}
-
-function createFallbackCoachingText(session: InterviewSession, latestInput: string): string {
-  const activeQuestion = getActiveQuestion(session);
-  const compactInput = compactText(latestInput, 180);
-
-  return [
-    `Rationale: The latest exchange gives usable evidence for ACTA probing: "${compactInput}".`,
-    activeQuestion
-      ? `Probe for the cues, trade-offs, and novice misunderstandings behind this answer before moving to: ${activeQuestion.text}`
-      : "Coverage is broad enough for a closing reflection. Ask what separates an expert decision from a good guess in this work.",
-  ].join("\n");
-}
-
-function countAskedByLevel(session: InterviewSession): Record<ActaLevel, number> {
-  return (["L1", "L2", "L3"] as ActaLevel[]).reduce<Record<ActaLevel, number>>(
-    (counts, level) => {
-      counts[level] = session.starterQuestions.filter(
-        (question) => question.actaLevel === level && question.status === "asked",
-      ).length;
-      return counts;
-    },
-    { L1: 0, L2: 0, L3: 0 },
-  );
-}
-
-function hasOpenAiKey(): boolean {
-  return Boolean(process.env.OPENAI_API_KEY?.trim());
-}
-
-function getModel(): string {
-  return process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
-}
-
-function splitTextParts(value: string): string[] {
-  return value
-    .split(/[\n,;]+|\s+-\s+|\d+\.\s+/)
-    .map(cleanListItem)
-    .filter((part) => part.length > 2);
-}
-
-function cleanListItem(value: string): string {
-  return value
-    .replace(/^[\s:.\-()[\]]+/, "")
-    .replace(/[\s:.\-()[\]]+$/, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function uniqueClean(values: string[]): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-
-  for (const value of values.map(cleanListItem)) {
-    const key = value.toLowerCase();
-    if (!value || seen.has(key)) {
-      continue;
-    }
-
-    seen.add(key);
-    result.push(value);
-  }
-
-  return result;
-}
-
-function fillToFive(values: string[], setting: InterviewSetting): string[] {
-  return fillList(uniqueClean(values), [
-    `Expert decision-making for ${setting.jobRoleTitle}`,
-    `Cognitive cues within ${setting.domainIndustry}`,
-    `Trade-offs and judgement under uncertainty`,
-    "Tacit heuristics and job smarts",
-    "Novice errors and onboarding risks",
-  ]).slice(0, 5);
-}
-
-function fillList(values: string[], fallback: string[]): string[] {
-  return uniqueClean([...values, ...fallback]);
-}
-
-function escapeTableCell(value: string): string {
-  return compactText(value.replace(/\|/g, "/"), 360);
-}
-
-function normalizeCommand(message: string): string {
-  return message
-    .trim()
-    .toLowerCase()
-    .replace(/[.!?]+$/g, "")
-    .replace(/\s+/g, " ");
-}
-
-function toTitle(value: string): string {
-  return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }

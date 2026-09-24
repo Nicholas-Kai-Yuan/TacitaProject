@@ -89,6 +89,10 @@ export const api = {
       body: JSON.stringify({ settingId }),
     }),
   getSession: (id: string) => request<InterviewSession>(`/api/sessions/${id}`),
+  requestWelcome: (id: string) =>
+    request<InterviewSession>(`/api/sessions/${id}/welcome`, {
+      method: "POST",
+    }),
   generateStarterQuestions: (id: string) =>
     request<InterviewSession>(`/api/sessions/${id}/generate-starter-questions`, {
       method: "POST",

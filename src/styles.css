@@ -871,7 +871,8 @@ button:disabled {
 }
 
 .rich-chat-content h2,
-.rich-chat-content h3 {
+.rich-chat-content h3,
+.rich-chat-content h4 {
   margin: 8px 0 0;
   color: #12425f;
   letter-spacing: 0;
@@ -882,7 +883,23 @@ button:disabled {
 }
 
 .rich-chat-content h3 {
+  font-size: 19px;
+}
+
+.rich-chat-content h4 {
   font-size: 17px;
+}
+
+.rich-chat-content hr {
+  width: 100%;
+  margin: 4px 0;
+  border: 0;
+  border-top: 1px solid #b9c9d6;
+}
+
+.rich-chat-content li > ul,
+.rich-chat-content li > ol {
+  margin-top: 6px;
 }
 
 .rich-chat-content p {
@@ -925,7 +942,9 @@ button:disabled {
   padding: 9px 10px;
   border-bottom: 1px solid #e5edf0;
   text-align: left;
-  vertical-align: top;
+  vertical-align: middle;
+  /* The inherited `anywhere` lets auto table layout shrink columns until words split mid-word. */
+  overflow-wrap: break-word;
 }
 
 .chat-table th {

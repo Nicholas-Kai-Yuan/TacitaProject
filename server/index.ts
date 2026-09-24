@@ -7,24 +7,19 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 import {
-  createChatReply,
-  createEndInterviewReply,
   createFollowUps,
-  createLiveInterviewTurnReply,
-  createMicOnReply,
-  createPreInterviewChecklistReply,
   createRefinedTranscript,
-  createStarterQuestionFlowReply,
   createStarterQuestions,
   createSummary,
-  hasPreInterviewChecklist,
-  isConfirmationCommand,
-  isEndInterviewCommand,
-  isProceedCommand,
-  isStartInterviewCommand,
+  describeAiError,
+  generateChatReply,
+  generateInterviewSummaryReply,
+  generateWelcomeReply,
+  isEndCommand,
 } from "./ai";
 import { createAuthSession, getAuth, requireRole } from "./auth";
 import {
+  addAssistantMessage,
   addChatExchange,
   addDiagnostic,
   addFollowUps,
@@ -243,6 +238,26 @@ app.post("/api/sessions", requireRole("interviewer"), async (request, response, 
   }
 });
 
+app.post("/api/sessions/:id/welcome", requireRole("interviewer"), async (request, response, next) => {
+  try {
+    const auth = getAuth(response);
+    const session = await getSession(routeParam(request, "id"), auth.accountId);
+    if (!session) {
+      response.status(404).json({ error: "Interview session not found" });
+      return;
+    }
+
+    try {
+      const welcome = await generateWelcomeReply(session.settingSnapshot);
+      response.json(await addAssistantMessage(session.id, welcome, auth.accountId));
+    } catch (aiError) {
+      response.status(502).json({ error: describeAiError(aiError) });
+    }
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/sessions/:id", requireRole("interviewer"), async (request, response, next) => {
   try {
     const session = await getSession(routeParam(request, "id"), getAuth(response).accountId);
@@ -266,8 +281,12 @@ app.post("/api/sessions/:id/generate-starter-questions", requireRole("interviewe
       return;
     }
 
-    const questions = await createStarterQuestions(session.settingSnapshot);
-    response.json(await setStarterQuestions(session.id, questions, auth.accountId));
+    try {
+      const questions = await createStarterQuestions(session.settingSnapshot);
+      response.json(await setStarterQuestions(session.id, questions, auth.accountId));
+    } catch (aiError) {
+      response.status(502).json({ error: describeAiError(aiError) });
+    }
   } catch (error) {
     next(error);
   }
@@ -349,8 +368,12 @@ app.post("/api/sessions/:id/followups", requireRole("interviewer"), async (reque
       return;
     }
 
-    const suggestions = await createFollowUps(session);
-    response.json(await addFollowUps(session.id, suggestions, auth.accountId));
+    try {
+      const suggestions = await createFollowUps(session);
+      response.json(await addFollowUps(session.id, suggestions, auth.accountId));
+    } catch (aiError) {
+      response.status(502).json({ error: describeAiError(aiError) });
+    }
   } catch (error) {
     next(error);
   }
@@ -385,100 +408,14 @@ app.post("/api/sessions/:id/chat", requireRole("interviewer"), async (request, r
       return;
     }
 
-    if (isEndInterviewCommand(message)) {
-      const summary = await createSummary(session);
-      const reply = createEndInterviewReply(session, summary);
-      await endSession(session.id, summary, auth.accountId);
+    try {
+      const reply = isEndCommand(message)
+        ? await generateInterviewSummaryReply(session.settingSnapshot, session.chatMessages)
+        : await generateChatReply(session.settingSnapshot, session.chatMessages, message);
       response.json(await addChatExchange(session.id, message, reply, auth.accountId));
-      return;
+    } catch (aiError) {
+      response.status(502).json({ error: describeAiError(aiError) });
     }
-
-    if (session.starterQuestions.length === 0) {
-      const checklistAlreadyShown = hasPreInterviewChecklist(session);
-
-      if (checklistAlreadyShown && isConfirmationCommand(message)) {
-        const questions = await createStarterQuestions(session.settingSnapshot);
-        await setStarterQuestions(session.id, questions, auth.accountId);
-        await approveQuestions(session.id, auth.accountId);
-
-        const readySession = await getSession(session.id, auth.accountId);
-        if (!readySession) {
-          response.status(404).json({ error: "Interview session not found" });
-          return;
-        }
-
-        const reply = createStarterQuestionFlowReply(readySession);
-        response.json(await addChatExchange(session.id, message, reply, auth.accountId));
-        return;
-      }
-
-      if (isProceedCommand(message)) {
-        const reply = await createPreInterviewChecklistReply(session.settingSnapshot);
-        response.json(await addChatExchange(session.id, message, reply, auth.accountId));
-        return;
-      }
-
-      const reply = await createChatReply(session, message);
-      response.json(await addChatExchange(session.id, message, reply, auth.accountId));
-      return;
-    }
-
-    if (isStartInterviewCommand(message)) {
-      const startedSession = session.status === "in_progress"
-        ? session
-        : await startSession(session.id, auth.accountId);
-      if (!startedSession) {
-        response.status(404).json({ error: "Interview session not found" });
-        return;
-      }
-
-      const reply = createMicOnReply(startedSession);
-      response.json(await addChatExchange(session.id, message, reply, auth.accountId));
-      return;
-    }
-
-    const activeSession = session.status === "in_progress"
-      ? session
-      : await startSession(session.id, auth.accountId);
-    if (!activeSession) {
-      response.status(404).json({ error: "Interview session not found" });
-      return;
-    }
-
-    await addTranscriptSegment(session.id, {
-      speaker: "unknown",
-      text: message,
-      submittedForAi: true,
-    }, auth.accountId);
-
-    const withTranscript = await getSession(session.id, auth.accountId);
-    if (!withTranscript) {
-      response.status(404).json({ error: "Interview session not found" });
-      return;
-    }
-
-    const nextQuestion = withTranscript.starterQuestions.find((question) => question.status === "planned");
-    if (nextQuestion) {
-      await updateQuestion(session.id, nextQuestion.id, { status: "asked" }, auth.accountId);
-    }
-
-    const afterQuestionUpdate = await getSession(session.id, auth.accountId);
-    if (!afterQuestionUpdate) {
-      response.status(404).json({ error: "Interview session not found" });
-      return;
-    }
-
-    const suggestions = await createFollowUps(afterQuestionUpdate);
-    await addFollowUps(session.id, suggestions, auth.accountId);
-
-    const coachedSession = await getSession(session.id, auth.accountId);
-    if (!coachedSession) {
-      response.status(404).json({ error: "Interview session not found" });
-      return;
-    }
-
-    const reply = await createLiveInterviewTurnReply(coachedSession, message);
-    response.json(await addChatExchange(session.id, message, reply, auth.accountId));
   } catch (error) {
     next(error);
   }
@@ -493,8 +430,12 @@ app.post("/api/sessions/:id/end", requireRole("interviewer"), async (request, re
       return;
     }
 
-    const summary = await createSummary(session);
-    response.json(await endSession(session.id, summary, auth.accountId));
+    try {
+      const summary = await createSummary(session);
+      response.json(await endSession(session.id, summary, auth.accountId));
+    } catch (aiError) {
+      response.status(502).json({ error: describeAiError(aiError) });
+    }
   } catch (error) {
     next(error);
   }
@@ -509,8 +450,12 @@ app.post("/api/sessions/:id/refined-transcript", requireRole("interviewer"), asy
       return;
     }
 
-    const refinedTranscript = await createRefinedTranscript(session);
-    response.json(await setRefinedTranscript(session.id, refinedTranscript, auth.accountId));
+    try {
+      const refinedTranscript = await createRefinedTranscript(session);
+      response.json(await setRefinedTranscript(session.id, refinedTranscript, auth.accountId));
+    } catch (aiError) {
+      response.status(502).json({ error: describeAiError(aiError) });
+    }
   } catch (error) {
     next(error);
   }

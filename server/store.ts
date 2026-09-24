@@ -286,6 +286,19 @@ export async function markSuggestionUsed(
   return getSession(sessionId, interviewerAccountId);
 }
 
+export async function addAssistantMessage(
+  sessionId: string,
+  content: string,
+  interviewerAccountId?: string,
+): Promise<InterviewSession | null> {
+  await ensureSessionAccess(sessionId, interviewerAccountId);
+  await convex.mutation(api.interviewSessions.addAssistantMessage, {
+    id: sessionId as never,
+    content,
+  });
+  return getSession(sessionId, interviewerAccountId);
+}
+
 export async function addChatExchange(
   sessionId: string,
   userMessage: string,
