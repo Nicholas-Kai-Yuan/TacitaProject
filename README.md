@@ -47,7 +47,8 @@ Add these values to `.env`:
 
 ```env
 OPENAI_API_KEY=your_key_here
-OPENAI_MODEL=gpt-4o-mini
+OPENAI_MODEL=gpt-6-sol
+OPENAI_REASONING_EFFORT=low
 ```
 
 Without an API key, starter questions, follow-ups, chat replies, and summaries still work using local deterministic fallbacks.

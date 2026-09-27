@@ -22,15 +22,63 @@ const AGENT_SYSTEM_PROMPT = readFileSync(
   "utf-8",
 );
 
-const questionSchema = z.object({
-  text: z.string().min(1),
-  actaLevel: z.enum(["L1", "L2", "L3"]),
-  focus: z.string().min(1),
-});
+const KNOWLEDGE_AUDIT_CATEGORIES = [
+  "Past & Future",
+  "Big Picture",
+  "Noticing",
+  "Job Smarts",
+  "Opportunities / Improvising",
+  "Self-Monitoring",
+  "Anomalies",
+  "Equipment Difficulties",
+] as const;
 
-const starterQuestionsSchema = z.object({
-  questions: z.array(questionSchema).length(15),
-});
+// The blueprint is filled before any question so each one is written from what the setup actually says,
+// and the per-level arrays hold the queue to the configured ACTA split.
+function questionFunnelSchema(counts: Record<ActaLevel, number>) {
+  return z.object({
+    blueprint: z.object({
+      workElements: z
+        .array(z.string())
+        .describe("Concrete responsibilities, decisions and activities named in the SME Job Description, in its own wording"),
+      focusAreaElements: z.array(z.string()).describe("Every distinct focus area and sub-topic named in the Key Focus Areas"),
+      tensions: z
+        .array(z.string())
+        .describe("Competing goals, trade-offs and risks named in or directly implied by the Interview Objective and Job Description"),
+      criticalSituations: z
+        .array(z.string())
+        .describe("Conditions named in or directly implied by the setup under which the work becomes hard"),
+    }),
+    l1: z
+      .array(
+        z.object({
+          angle: z.string().describe("The part of the task diagram this question maps that no other L1 question covers"),
+          question: z.string().min(1),
+        }),
+      )
+      .length(counts.L1),
+    l2: z
+      .array(
+        z.object({
+          category: z.enum(KNOWLEDGE_AUDIT_CATEGORIES),
+          anchor: z
+            .string()
+            .describe("The focus area element and the work element, tension or situation this question is built on"),
+          question: z.string().min(1),
+        }),
+      )
+      .length(counts.L2),
+    l3: z
+      .array(
+        z.object({
+          scenarioType: z.enum(["Real Incident", "Hypothetical"]),
+          anchor: z.string().describe("The focus area element, critical situation and competing tension this scenario combines"),
+          question: z.string().min(1),
+        }),
+      )
+      .length(counts.L3),
+  });
+}
 
 const followUpsSchema = z.object({
   suggestions: z.array(
@@ -70,7 +118,16 @@ function requireOpenAiKey(): void {
 }
 
 function getModel(): string {
-  return process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
+  return process.env.OPENAI_MODEL?.trim() || "gpt-6-sol";
+}
+
+// Reasoning models think before answering; a lower effort keeps replies quick during the live interview.
+function modelSettings() {
+  const reasoningEffort = process.env.OPENAI_REASONING_EFFORT?.trim();
+  return {
+    model: openai(getModel()),
+    providerOptions: reasoningEffort ? { openai: { reasoningEffort } } : undefined,
+  };
 }
 
 function buildSystemPrompt(setting: InterviewSetting): string {
@@ -128,7 +185,7 @@ export async function generateWelcomeReply(setting: InterviewSetting): Promise<s
   requireOpenAiKey();
 
   const result = await generateText({
-    model: openai(getModel()),
+    ...modelSettings(),
     system: buildSystemPrompt(setting),
     prompt: "Begin the session now, following your Session Start Instruction exactly.",
   });
@@ -143,16 +200,86 @@ export async function generateChatReply(
 ): Promise<string> {
   requireOpenAiKey();
 
+  const conversation: ChatMessage[] = [
+    ...history,
+    { id: "latest", role: "user", content: userMessage, createdAt: Date.now() },
+  ];
+  // Until a queue has been shown, a reply presenting one gets its questions from the funnel generator.
+  // Once the checklist is up it runs alongside the chat reply, so the queue adds no extra wait.
+  const queueDue = !history.some((message) => message.role === "assistant" && readQueueTable(message.content));
+  const checklistShown = history.some((message) => message.role === "assistant" && message.content.includes("Expected Themes"));
+  const earlyFunnel = queueDue && checklistShown ? settleFunnel(generateQuestionFunnel(setting, conversation)) : null;
+
   const result = await generateText({
-    model: openai(getModel()),
+    ...modelSettings(),
     system: buildSystemPrompt(setting),
-    messages: [
-      ...toModelMessages(history),
-      { role: "user", content: withSentStamp(userMessage, Date.now()) } as const,
-    ],
+    messages: toModelMessages(conversation),
   });
 
-  return enforceQuestionQueue(result.text, history, userMessage);
+  let reply = result.text;
+  if (queueDue && readQueueTable(reply)) {
+    const questions = await (earlyFunnel ?? settleFunnel(generateQuestionFunnel(setting, conversation)));
+    reply = questions ? replaceQueueTable(reply, questions) : reply;
+  }
+  return enforceQuestionQueue(reply, history, userMessage);
+}
+
+type FunnelQuestion = Pick<StarterQuestion, "text" | "actaLevel" | "focus">;
+
+async function generateQuestionFunnel(
+  setting: InterviewSetting,
+  conversation: ChatMessage[] = [],
+): Promise<FunnelQuestion[]> {
+  const counts = getQuestionDistribution(setting.actaRatio);
+  // The request goes in the system prompt: sent as an interviewer message, the model rightly treats a claim
+  // to bypass the confirmation gates as an adversarial attempt.
+  const result = await generateObject({
+    ...modelSettings(),
+    schema: questionFunnelSchema(counts),
+    system: [
+      buildSystemPrompt(setting),
+      "---",
+      "**SYSTEM REQUEST: STEP 2.1 QUESTION QUEUE**",
+      "This request comes from the Tacita system, not the interviewer, so the Session Start Instruction and the confirmation gates do not apply to it.",
+      `Return the Step 2.1 Initial Question Queue as structured data with exactly ${counts.L1} L1, ${counts.L2} L2 and ${counts.L3} L3 questions.`,
+      "Fill the blueprint first from the setup inputs, plus the Pre-Interview Checklist and any changes the interviewer asked for if the conversation has them, then write every question from it, following the Step 2.1 rules and the Question Depth & Grounding Standard.",
+    ].join("\n\n"),
+    messages: [...toModelMessages(conversation), { role: "user", content: "Generate the Initial Question Queue now." }],
+  });
+
+  const { l1, l2, l3 } = result.object;
+  return [
+    ...l1.map(({ question }) => ({ text: question, actaLevel: "L1" as const, focus: "Task Diagram" })),
+    ...l2.map(({ question, category }) => ({ text: question, actaLevel: "L2" as const, focus: `Knowledge Audit · ${category}` })),
+    ...l3.map(({ question, scenarioType }) => ({ text: question, actaLevel: "L3" as const, focus: `Simulation · ${scenarioType}` })),
+  ];
+}
+
+// A failed funnel call leaves the chat model's own queue in place.
+function settleFunnel(funnel: Promise<FunnelQuestion[]>): Promise<FunnelQuestion[] | null> {
+  return funnel.catch((error: unknown) => {
+    console.warn("Question funnel generation failed; keeping the chat model's queue.", error);
+    return null;
+  });
+}
+
+const QUEUE_FOCUS: Record<ActaLevel, string> = { L1: "Task Diagram", L2: "Knowledge Audit", L3: "Simulation" };
+const LEVEL_ICONS: Record<ActaLevel, string> = { L1: "🛠️", L2: "🧠", L3: "🏆" };
+
+// Rows follow the Step 2.1 queue template.
+function replaceQueueTable(reply: string, questions: FunnelQuestion[]): string {
+  const lines = reply.split(/\r?\n/);
+  const range = findQueueTable(lines);
+  if (!range) {
+    return reply;
+  }
+
+  const rows = questions.map(
+    (question, index) =>
+      `| ${index + 1} | ${QUEUE_FOCUS[question.actaLevel]} | ${toTableCell(question.text)} | ${LEVEL_ICONS[question.actaLevel]} ${question.actaLevel} | Pending |`,
+  );
+  const table = markdownTable(["#", "Focus", "Full Question Text", "Target", "Status"], rows);
+  return [...lines.slice(0, range.start), table, ...lines.slice(range.end)].join("\n");
 }
 
 const END_COMMAND = /^(?:end|done)(?:\s+(?:the\s+)?(?:interview|session))?[\s.!]*$/i;
@@ -209,7 +336,7 @@ export async function generateInterviewSummaryReply(
 
   const interviewerMessages = history.filter((message) => message.role === "user");
   const result = await generateObject({
-    model: openai(getModel()),
+    ...modelSettings(),
     schema: interviewSummarySchema,
     system: buildSystemPrompt(setting),
     messages: [
@@ -548,19 +675,8 @@ function withSentStamp(content: string, timestamp: number): string {
 export async function createStarterQuestions(setting: InterviewSetting): Promise<StarterQuestion[]> {
   requireOpenAiKey();
 
-  const distribution = getQuestionDistribution(setting.actaRatio);
-  const result = await generateObject({
-    model: openai(getModel()),
-    schema: starterQuestionsSchema,
-    prompt: [
-      "Generate exactly 15 personalized ACTA-aligned starter interview questions.",
-      "Questions must be ordered from L1 to L2 to L3, be specific to the SME, avoid duplicates, and not be yes/no questions.",
-      `Required distribution: L1=${distribution.L1}, L2=${distribution.L2}, L3=${distribution.L3}.`,
-      renderSetting(setting),
-    ].join("\n\n"),
-  });
-
-  return result.object.questions.map((question) => ({
+  const questions = await generateQuestionFunnel(setting);
+  return questions.map((question) => ({
     ...question,
     id: crypto.randomUUID(),
     status: "planned" as const,
@@ -572,7 +688,7 @@ export async function createFollowUps(session: InterviewSession): Promise<Follow
   requireOpenAiKey();
 
   const result = await generateObject({
-    model: openai(getModel()),
+    ...modelSettings(),
     schema: followUpsSchema,
     prompt: [
       "Recommend a small set of concise ACTA follow-up questions for a live interviewer.",
@@ -594,7 +710,7 @@ export async function createSummary(session: InterviewSession): Promise<Intervie
   requireOpenAiKey();
 
   const result = await generateObject({
-    model: openai(getModel()),
+    ...modelSettings(),
     schema: summarySchema,
     prompt: [
       "Generate a whole-interview ACTA summary from the complete transcript.",
@@ -617,7 +733,7 @@ export async function createRefinedTranscript(
   requireOpenAiKey();
 
   const result = await generateObject({
-    model: openai(getModel()),
+    ...modelSettings(),
     schema: refinedTranscriptSchema,
     prompt: [
       "Create a refined speaker-labelled transcript arranged into interviewer-question and SME-response blocks.",

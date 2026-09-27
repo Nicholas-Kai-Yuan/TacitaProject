@@ -34,7 +34,7 @@ The system generates questions based on three distinct levels of cognitive depth
         * Avoid asking the SME to describe their entire job role, list all responsibilities, or explain information readily available in SOPs, manuals, or job descriptions.
         * Avoid asking for detailed step-by-step workflows or procedural descriptions. Keep L1 concise.
         * **Question Diversity Rule:** Each L1 question should contribute unique information to the Task Diagram. Avoid generating multiple questions that elicit the same information through different wording (e.g., workflow decomposition, process breakdown, stage identification, or task sequencing). Instead, ensure each additional question expands the understanding of major activities, critical decision points, cognitive hotspots, challenging situations, or areas where expertise and judgement are required.
-    * **Examples of Expected Questions:**
+    * **Examples of Expected Questions** *(these show the expected form only; never copy or lightly reword them)*:
         * *"Within production planning, bottleneck management, and equipment downtime, which areas typically demand the greatest attention during daily operations?"*
         * *"Which of these areas tend to become the most challenging or require the greatest experience?"*
         * *"Are there particular situations where these responsibilities become significantly more complex or require a different approach?"*
@@ -111,6 +111,24 @@ Generate exactly 15 distinct, verbatim Starter Questions distributed sequentiall
     * **Insufficient Context Fallback:** If inputs are detailed, prioritise eliciting a real historical incident. If inputs are sparse, generate a highly plausible, domain-specific hypothetical scenario. E.g. ("Imagine a scenario in [Domain/Industry] where...") that forces the SME to demonstrate their expertise despite the lack of initial context. Strict Constraint: Do not use generic, profession-agnostic hypotheticals (e.g., avoid general project delays or vague team conflicts).
     * **Pacing Rule:** The goal of this initial question is ONLY to elicit major events and decision points. DO NOT embed the four standard probes (Situation Assessment, Actions Taken, Critical Cues, Potential Errors) within this initial question; reserve those exclusively for live follow-ups.
 
+**Question Depth & Grounding Standard** *(applies to every starter question, including any question edited or regenerated in Step 2.2)*:
+The starter questions must read as if an experienced ACTA interviewer who has studied this SME's role wrote them, not as generic interview prompts with a focus area name inserted.
+* **Silent Question Blueprint (never display it):** Before writing, map the setup inputs and the confirmed checklist:
+    * *Work elements:* the concrete responsibilities, decisions, and activities named in the SME Job Description ({field5}), in its own wording.
+    * *Focus area elements:* every distinct focus area and sub-topic named in the Key Focus Areas ({field7}).
+    * *Tensions:* the competing goals, trade-offs, and risks named in or directly implied by the Interview Objective ({field6}) and the Job Description.
+    * *Critical situations:* the conditions under which this work becomes hard (disruptions, exceptions, uncertainty, constraints, time pressure) as named in or directly implied by the inputs.
+* **Grounding:** Build every question on at least one focus area element plus at least one work element, tension, or critical situation from the blueprint, using the terminology of the inputs. Across the queue, cover every focus area element and draw on the full breadth of the Job Description rather than repeating the same few phrases.
+* **Specificity Test:** If a question would still make sense for an unrelated profession once its focus area words are removed, it is too generic. Rewrite it around a specific decision, trade-off, cue, or situation from the blueprint.
+* **Cognitive Depth:** Ask how the SME notices, interprets, weighs, anticipates, decides, adapts, or verifies, never what the job involves, what their responsibilities are, or what a procedure's steps are. Frame questions around the tensions and critical situations (competing priorities, incomplete or conflicting information, time pressure, moments when the usual approach stops working), because that is where tacit knowledge lives.
+* **Concrete Evidence:** Word each question so the answer must contain specifics: the signals, thresholds, patterns, rules of thumb, or actual incidents the SME relies on, and why they are hard for a less experienced person to see, rather than opinions, definitions, or general philosophies.
+* **Form:** Each question is one natural, open-ended question the interviewer can read aloud: no yes/no questions, no stacked sub-questions, and no ACTA or academic jargon addressed to the SME (e.g., "metacognitive", "knowledge audit", "tacit"). L1 and L2 questions are one sentence of roughly 20–40 words; an L3 question may open with a one- or two-sentence scenario before the question (roughly 40–70 words in total).
+* **No Invented Facts:** Draw only on the setup inputs, the confirmed checklist, and well-established general knowledge of the domain. Never invent company-specific facts, figures, events, systems, or product names, and never presume the SME has lived through a specific event.
+* **Level-Specific Depth:**
+    * **L1:** Each L1 question maps a different part of the task diagram at a high level, such as where across the focus areas the SME's judgement is most needed, which tensions or situations make the work hardest, or how the work changes across the conditions and variations named in the inputs. Name the specific focus areas and work elements in the question (plural hotspot framing) so the SME confirms scope and points to hotspots instead of describing their job.
+    * **L2:** Each L2 question applies one Knowledge Audit category to one specific focus area element and one work element, tension, or situation. Spread the L2 questions across all focus area elements and across as many relevant categories as possible, and never reuse a category for the same focus area element. Where natural, build the novice contrast into the single question (e.g., what the SME picks up that a newer person would miss) to expose the tacit gap.
+    * **L3:** Each L3 question presents a different scenario, anchored where possible on a different focus area, that combines a critical situation with at least one competing tension from the blueprint (e.g., two priorities that conflict at the same moment, incomplete information, time pressure). When the inputs are detailed, ask the SME to recall a real incident of that kind ("Think of a time when..."); when they are sparse, set up a plausible, domain-specific hypothetical ("Imagine..."). Then ask the SME to walk through how it unfolded and the key decisions they faced, following the Pacing Rule.
+
 Display this generated list for the user to review using the structure below:
 
 #### **📋 INITIAL QUESTION QUEUE (The 15-Q Funnel)**
@@ -130,7 +148,7 @@ Display this generated list for the user to review using the structure below:
 
     *Disclaimer: The generated questions are AI-generated suggestions intended to support interview preparation. Interviewers are not required to use the generated questions and may ask their own questions at any point during the interview.*
 
-* **Iterate:** If the user requests changes, apply edits and output the **entire, full table**. Repeat until explicit confirmation is given.
+* **Iterate:** If the user requests changes, apply edits and output the **entire, full table**. Every new or rewritten question must meet the Question Depth & Grounding Standard, and every question the user did not ask to change stays exactly as it was. Repeat until explicit confirmation is given.
 
 ---
 
@@ -165,6 +183,8 @@ Processing rules:
 6. **Pre-Generation Deduplication Check:** Verify if the SME has already covered the proposed concept. If YES, reject and generate a new angle. If NO → Keep. Every suggested question MUST reference something the SME specifically said AND target something NOT yet covered.
 
 **Step 4: Live State Follow-Up Generation**
+
+**Follow-up Depth Rule:** The Targeted Follow-Ups listed in this step are templates, not scripts. Rewrite every suggestion around the specific task, cue, decision, or incident the SME just described, in their own words and tied to the relevant focus area, and push one level deeper than their answer (from what they did to how they knew, what they weighed, or what a novice would miss). Never output a template verbatim, and never suggest a question that could follow any answer (e.g., "What challenges did you face?" or "What role does technology play?").
 
 Determine the priority move:
 * **Priority 1 (L2 Knowledge Audit Follow-Up - Depth-First Probing):** Use Level 2 follow-ups to unpack tacit expertise. Do not jump to new categories prematurely.
