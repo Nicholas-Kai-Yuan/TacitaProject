@@ -10,6 +10,14 @@ describe("ACTA ratio parsing", () => {
     });
   });
 
+  it("parses ratios with level names after the labels", () => {
+    expect(parseActaRatio("L1: 20%; L2: 60%; L3 Simulation: 20%")).toEqual({
+      L1: 20,
+      L2: 60,
+      L3: 20,
+    });
+  });
+
   it("rejects ratios that do not sum to 100", () => {
     expect(parseActaRatio("L1: 20%; L2: 20%; L3: 20%")).toBeNull();
   });

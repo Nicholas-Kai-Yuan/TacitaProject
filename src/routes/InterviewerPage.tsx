@@ -3,6 +3,8 @@ import { Link, useNavigate } from "react-router-dom";
 import { ClipboardList, PlayCircle, RefreshCw } from "lucide-react";
 import { api } from "../api/client";
 import EmptyState from "../components/EmptyState";
+import ToolInstructions from "../components/ToolInstructions";
+import { BEGIN_BUTTON_TEXT, TOOL_DESCRIPTION, TOOL_NAME, chatThreadTitle } from "../tacitaTool";
 import type { InterviewSetting, InterviewSession } from "../../shared/types";
 
 export default function InterviewerPage() {
@@ -54,13 +56,16 @@ export default function InterviewerPage() {
       <div className="section-heading">
         <div>
           <p className="eyebrow">Interviewer</p>
-          <h1>Interview Settings</h1>
+          <h1>{TOOL_NAME}</h1>
+          <p className="muted-line">{TOOL_DESCRIPTION}</p>
         </div>
         <button className="secondary-action" type="button" onClick={() => void load()}>
           <RefreshCw size={17} />
           Refresh
         </button>
       </div>
+
+      <ToolInstructions />
 
       {error && <div className="alert">{error}</div>}
 
@@ -105,7 +110,7 @@ export default function InterviewerPage() {
                 disabled={busySettingId === setting.id}
               >
                 <PlayCircle size={18} />
-                {busySettingId === setting.id ? "Creating..." : "Conduct Interview"}
+                {busySettingId === setting.id ? "Creating..." : BEGIN_BUTTON_TEXT}
               </button>
             </article>
           ))}
@@ -127,7 +132,7 @@ export default function InterviewerPage() {
             {activeSessions.map((session) => (
               <Link className="session-row" to={`/interviewer/sessions/${session.id}`} key={session.id}>
                 <span>
-                  <strong>{session.settingSnapshot.smeName}</strong>
+                  <strong>{chatThreadTitle(session.settingSnapshot)}</strong>
                   <small>{session.settingSnapshot.jobRoleTitle}</small>
                 </span>
                 <span className="status-pill">{session.status.replaceAll("_", " ")}</span>

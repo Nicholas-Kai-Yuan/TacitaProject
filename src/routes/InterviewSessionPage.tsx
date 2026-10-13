@@ -1,27 +1,9 @@
-import { ChangeEvent, FormEvent, Fragment, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, Fragment, type KeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import {
-  Bot,
-  CheckCircle2,
-  ChevronDown,
-  ChevronUp,
-  FileText,
-  ListChecks,
-  MessageSquareText,
-  Mic,
-  Power,
-  RefreshCw,
-  Save,
-  Send,
-  Sparkles,
-  Square,
-  Wand2,
-  Wrench,
-} from "lucide-react";
+import { MessageSquareText, Mic, Send } from "lucide-react";
 import { api } from "../api/client";
-import ActaBadge from "../components/ActaBadge";
-import ProgressBars from "../components/ProgressBars";
-import type { InterviewSession, QuestionStatus, Speaker } from "../../shared/types";
+import { chatThreadTitle } from "../tacitaTool";
+import type { InterviewSession } from "../../shared/types";
 
 export default function InterviewSessionPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
@@ -29,41 +11,28 @@ export default function InterviewSessionPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [toolsOpen, setToolsOpen] = useState(false);
-  const [speaker, setSpeaker] = useState<Speaker>("sme");
-  const [transcriptText, setTranscriptText] = useState("");
   const [chatMessage, setChatMessage] = useState("");
-  const [recordingState, setRecordingState] = useState<"idle" | "recording">("idle");
-  const [audioStatus, setAudioStatus] = useState("Mic idle");
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const socketRef = useRef<WebSocket | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
-
-  const canApprove = useMemo(
-    () => Boolean(session?.starterQuestions.length === 15 && session.status === "questions_generated"),
-    [session],
-  );
-  const checklistShown = useMemo(
-    () =>
-      Boolean(
-        session?.chatMessages.some(
-          (message) => message.role === "assistant" && message.content.includes("Pre-Interview Checklist"),
-        ),
-      ),
-    [session],
-  );
+  const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     if (sessionId) {
       void loadSession(sessionId);
     }
-
-    return () => stopRecording();
   }, [sessionId]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [session?.chatMessages.length]);
+
+  // The input grows with its text; CSS sets the starting height and the cap.
+  useEffect(() => {
+    const input = chatInputRef.current;
+    if (input) {
+      input.style.height = "auto";
+      input.style.height = `${input.scrollHeight}px`;
+    }
+  }, [chatMessage]);
 
   async function loadSession(id = sessionId) {
     if (!id) {
@@ -97,26 +66,17 @@ export default function InterviewSessionPage() {
     }
   }
 
-  async function saveTranscript(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!session || !transcriptText.trim()) {
-      return;
-    }
-
-    const text = transcriptText;
-    setTranscriptText("");
-    await runAction("transcript", () =>
-      api.addTranscript(session.id, {
-        speaker,
-        text,
-        submittedForAi: true,
-      }),
-    );
-  }
-
   async function sendChat(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     await submitChatMessage(chatMessage);
+  }
+
+  // Enter sends; Shift+Enter adds a new line.
+  function handleChatKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      event.currentTarget.form?.requestSubmit();
+    }
   }
 
   async function submitChatMessage(message: string) {
@@ -127,82 +87,6 @@ export default function InterviewSessionPage() {
     const text = message.trim();
     setChatMessage("");
     await runAction("chat", () => api.chat(session.id, text));
-  }
-
-  async function sendQuickChat(message: string) {
-    if (!session) {
-      return;
-    }
-
-    setChatMessage("");
-    await runAction("chat", () => api.chat(session.id, message));
-  }
-
-  async function updateQuestionText(questionId: string, text: string) {
-    if (!session) {
-      return;
-    }
-
-    setSession({
-      ...session,
-      starterQuestions: session.starterQuestions.map((question) =>
-        question.id === questionId ? { ...question, text } : question,
-      ),
-    });
-  }
-
-  async function persistQuestion(questionId: string, patch: { text?: string; status?: QuestionStatus }) {
-    if (!session) {
-      return;
-    }
-
-    await runAction(`question-${questionId}`, () => api.updateQuestion(session.id, questionId, patch));
-  }
-
-  async function startRecording() {
-    if (!session || recordingState === "recording") {
-      return;
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      const host = window.location.host;
-      const socket = new WebSocket(`${protocol}://${host}/audio/${session.id}`);
-      socketRef.current = socket;
-
-      socket.onmessage = (event) => {
-        const payload = JSON.parse(event.data) as { chunkCount: number; transcribed: boolean };
-        setAudioStatus(payload.transcribed ? "Transcript received" : `Audio chunks sent: ${payload.chunkCount}`);
-      };
-
-      const recorder = new MediaRecorder(stream, { mimeType: pickMimeType() });
-      mediaRecorderRef.current = recorder;
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
-          socket.send(event.data);
-        }
-      };
-      recorder.onstop = () => {
-        stream.getTracks().forEach((track) => track.stop());
-      };
-      socket.onopen = () => recorder.start(1200);
-      setRecordingState("recording");
-      setAudioStatus("Mic starting");
-      await runAction("start", () => api.startSession(session.id));
-    } catch (recordingError) {
-      setError(recordingError instanceof Error ? recordingError.message : "Unable to start microphone");
-      stopRecording();
-    }
-  }
-
-  function stopRecording() {
-    mediaRecorderRef.current?.stop();
-    mediaRecorderRef.current = null;
-    socketRef.current?.close();
-    socketRef.current = null;
-    setRecordingState("idle");
-    setAudioStatus("Mic idle");
   }
 
   if (isLoading) {
@@ -228,7 +112,7 @@ export default function InterviewSessionPage() {
             Back to interviewer
           </Link>
           <p className="eyebrow">Interview Session</p>
-          <h1>{session.settingSnapshot.smeName}</h1>
+          <h1>{chatThreadTitle(session.settingSnapshot)}</h1>
           <p>{`${session.settingSnapshot.jobRoleTitle} · ${session.settingSnapshot.domainIndustry}`}</p>
         </div>
         <span className="status-pill large">{session.status.replaceAll("_", " ")}</span>
@@ -259,9 +143,12 @@ export default function InterviewSessionPage() {
         </div>
 
         <form className="chat-form guided-chat-form" onSubmit={sendChat}>
-          <input
+          <textarea
+            ref={chatInputRef}
             value={chatMessage}
             onChange={(event) => setChatMessage(event.target.value)}
+            onKeyDown={handleChatKeyDown}
+            rows={4}
             placeholder={session.status === "ended" ? "Interview ended" : "Proceed, Mic On, transcript, or End"}
             disabled={session.status === "ended" || busy === "chat"}
           />
@@ -275,19 +162,8 @@ export default function InterviewSessionPage() {
           </button>
         </form>
 
-        <div className="button-row chat-shortcuts">
-          {session.starterQuestions.length === 0 && (
-            <button
-              className="secondary-action"
-              type="button"
-              onClick={() => void sendQuickChat(checklistShown ? "Yes proceed" : "Proceed")}
-              disabled={busy === "chat"}
-            >
-              <CheckCircle2 size={16} />
-              {checklistShown ? "Confirm Checklist" : "Proceed"}
-            </button>
-          )}
-          {session.starterQuestions.length > 0 && session.status !== "ended" && (
+        {session.starterQuestions.length > 0 && session.status !== "ended" && (
+          <div className="button-row chat-shortcuts">
             <button
               className="secondary-action"
               type="button"
@@ -297,320 +173,9 @@ export default function InterviewSessionPage() {
               <Mic size={16} />
               Mic On
             </button>
-          )}
-          {session.status !== "ended" && (
-            <button
-              className="danger-action"
-              type="button"
-              onClick={() => void sendQuickChat("End")}
-              disabled={busy === "chat"}
-            >
-              <Power size={16} />
-              End
-            </button>
-          )}
-        </div>
-      </section>
-
-      <button
-        className="secondary-action inline-action tools-toggle"
-        type="button"
-        onClick={() => setToolsOpen((open) => !open)}
-      >
-        <Wrench size={16} />
-        {toolsOpen ? "Hide Interview Tools" : "Show Interview Tools"}
-        {toolsOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-      </button>
-
-      {toolsOpen && (
-        <>
-      <section className="workspace-grid">
-        <div className="panel question-panel">
-          <div className="section-heading compact">
-            <div>
-              <p className="eyebrow">ACTA Queue</p>
-              <h1>Starter Questions</h1>
-            </div>
-            {session.starterQuestions.length === 0 ? (
-              <button
-                className="primary-action"
-                type="button"
-                onClick={() => void runAction("generate", () => api.generateStarterQuestions(session.id))}
-                disabled={busy === "generate"}
-              >
-                <Wand2 size={18} />
-                {busy === "generate" ? "Working..." : "Generate Starter Questions"}
-              </button>
-            ) : (
-              <button
-                className="secondary-action"
-                type="button"
-                onClick={() => void runAction("generate", () => api.generateStarterQuestions(session.id))}
-                disabled={busy === "generate"}
-              >
-                <RefreshCw size={17} />
-                Regenerate
-              </button>
-            )}
-          </div>
-
-          {session.starterQuestions.length === 0 ? (
-            <div className="empty-inline">
-              <ListChecks size={22} />
-              <span>No questions generated.</span>
-            </div>
-          ) : (
-            <div className="question-list">
-              {session.starterQuestions.map((question, index) => (
-                <article className={`question-item ${question.status}`} key={question.id}>
-                  <div className="question-number">{index + 1}</div>
-                  <div className="question-body">
-                    <div className="question-meta">
-                      <ActaBadge level={question.actaLevel} />
-                      <span>{question.focus}</span>
-                    </div>
-                    <textarea
-                      value={question.text}
-                      rows={3}
-                      onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
-                        void updateQuestionText(question.id, event.target.value)
-                      }
-                      onBlur={(event) => void persistQuestion(question.id, { text: event.target.value })}
-                    />
-                    <div className="button-row">
-                      <button
-                        className="secondary-action"
-                        type="button"
-                        onClick={() => void persistQuestion(question.id, { status: "asked" })}
-                      >
-                        <CheckCircle2 size={16} />
-                        Asked
-                      </button>
-                      <button
-                        className="ghost-action"
-                        type="button"
-                        onClick={() => void persistQuestion(question.id, { status: "skipped" })}
-                      >
-                        <Square size={16} />
-                        Skip
-                      </button>
-                    </div>
-                  </div>
-                </article>
-              ))}
-            </div>
-          )}
-
-          {canApprove && (
-            <button
-              className="primary-action full-width"
-              type="button"
-              onClick={() => void runAction("approve", () => api.approveQuestions(session.id))}
-              disabled={busy === "approve"}
-            >
-              <CheckCircle2 size={18} />
-              Approve Question Queue
-            </button>
-          )}
-        </div>
-
-        <aside className="panel progress-panel">
-          <div className="section-heading compact">
-            <div>
-              <p className="eyebrow">Coverage</p>
-              <h1>Progress</h1>
-            </div>
-          </div>
-          <ProgressBars session={session} />
-        </aside>
-      </section>
-
-      <section className="workspace-grid live-grid">
-        <div className="panel">
-          <div className="section-heading compact">
-            <div>
-              <p className="eyebrow">Live Interview</p>
-              <h1>Capture</h1>
-            </div>
-            <div className="button-row">
-              {recordingState === "idle" ? (
-                <button
-                  className="secondary-action"
-                  type="button"
-                  onClick={() => void startRecording()}
-                  disabled={session.status === "draft" || session.status === "questions_generated"}
-                  title="Start microphone"
-                >
-                  <Mic size={17} />
-                  Start
-                </button>
-              ) : (
-                <button className="danger-action" type="button" onClick={stopRecording} title="Stop microphone">
-                  <Square size={17} />
-                  Stop
-                </button>
-              )}
-            </div>
-          </div>
-          <div className="audio-meter">
-            <span className={recordingState === "recording" ? "pulse-dot live" : "pulse-dot"} />
-            <span>{audioStatus}</span>
-          </div>
-
-          <form className="transcript-form" onSubmit={saveTranscript}>
-            <div className="field-row">
-              <label className="field compact-field">
-                <span>Speaker</span>
-                <select value={speaker} onChange={(event) => setSpeaker(event.target.value as Speaker)}>
-                  <option value="sme">SME</option>
-                  <option value="interviewer">Interviewer</option>
-                  <option value="unknown">Unknown</option>
-                </select>
-              </label>
-            </div>
-            <label className="field">
-              <span>Transcript Segment</span>
-              <textarea
-                value={transcriptText}
-                onChange={(event) => setTranscriptText(event.target.value)}
-                rows={5}
-                placeholder="Paste or type captured dialogue"
-              />
-            </label>
-            <div className="button-row">
-              <button className="primary-action" type="submit" disabled={!transcriptText.trim() || busy === "transcript"}>
-                <Save size={18} />
-                Save Segment
-              </button>
-              <button
-                className="secondary-action"
-                type="button"
-                onClick={() => void runAction("followups", () => api.generateFollowUps(session.id))}
-                disabled={session.transcriptSegments.length === 0 || busy === "followups"}
-              >
-                <Sparkles size={17} />
-                {busy === "followups" ? "Thinking..." : "AI Follow-Ups"}
-              </button>
-            </div>
-          </form>
-        </div>
-
-        <div className="panel">
-          <div className="section-heading compact">
-            <div>
-              <p className="eyebrow">AI</p>
-              <h1>Recommendations</h1>
-            </div>
-          </div>
-          {session.followUpSuggestions.length === 0 ? (
-            <div className="empty-inline">
-              <Sparkles size={22} />
-              <span>No follow-ups yet.</span>
-            </div>
-          ) : (
-            <div className="suggestion-list">
-              {session.followUpSuggestions.map((suggestion) => (
-                <article className="suggestion-item" key={suggestion.id}>
-                  <div className="question-meta">
-                    <ActaBadge level={suggestion.actaLevel} />
-                    <span>{suggestion.focus}</span>
-                  </div>
-                  <p>{suggestion.text}</p>
-                  <small>{suggestion.rationale}</small>
-                  <button
-                    className="secondary-action"
-                    type="button"
-                    disabled={suggestion.used}
-                    onClick={() => void runAction(`use-${suggestion.id}`, () => api.markSuggestionUsed(session.id, suggestion.id))}
-                  >
-                    <CheckCircle2 size={16} />
-                    {suggestion.used ? "Used" : "Mark Used"}
-                  </button>
-                </article>
-              ))}
-            </div>
-          )}
-        </div>
-      </section>
-
-      <section className="workspace-grid live-grid">
-        <div className="panel">
-          <div className="section-heading compact">
-            <div>
-              <p className="eyebrow">Transcript</p>
-              <h1>Session Log</h1>
-            </div>
-            <span className="count-pill">{session.transcriptSegments.length}</span>
-          </div>
-          <div className="transcript-list">
-            {session.transcriptSegments.map((segment) => (
-              <article className={`transcript-row ${segment.speaker}`} key={segment.id}>
-                <strong>{segment.speaker}</strong>
-                <p>{segment.text}</p>
-              </article>
-            ))}
-          </div>
-          {session.transcriptSegments.length === 0 && (
-            <div className="empty-inline">
-              <Bot size={22} />
-              <span>Interview transcript will appear here after chat exchanges are submitted.</span>
-            </div>
-          )}
-        </div>
-      </section>
-
-      <section className="panel">
-        <div className="section-heading compact">
-          <div>
-            <p className="eyebrow">Outputs</p>
-            <h1>Post-Interview</h1>
-          </div>
-          <div className="button-row">
-            <button
-              className="primary-action"
-              type="button"
-              disabled={session.status === "ended" || busy === "end"}
-              onClick={() => void runAction("end", () => api.endSession(session.id))}
-            >
-              <FileText size={18} />
-              {busy === "end" ? "Generating..." : "End & Summarize"}
-            </button>
-            <button
-              className="secondary-action"
-              type="button"
-              disabled={session.transcriptSegments.length === 0 || busy === "refined"}
-              onClick={() => void runAction("refined", () => api.refinedTranscript(session.id))}
-            >
-              <ListChecks size={17} />
-              Refined Transcript
-            </button>
-          </div>
-        </div>
-
-        {session.summary && (
-          <div className="summary-grid">
-            <SummarySection title="L1 Task Map and Cognitive Hotspots" items={session.summary.taskMap} />
-            <SummarySection title="L2 Tacit Expert Knowledge" items={session.summary.tacitKnowledge} />
-            <SummarySection title="L3 Scenario / Incident Analysis" items={session.summary.scenarioFindings} />
-            <SummarySection title="Future Exploration" items={session.summary.futureExploration} />
-          </div>
-        )}
-
-        {session.refinedTranscript && (
-          <div className="refined-list">
-            {session.refinedTranscript.map((block) => (
-              <article className="refined-block" key={block.id}>
-                <strong>Interviewer</strong>
-                <p>{block.interviewerQuestion}</p>
-                <strong>SME</strong>
-                <p>{block.smeResponse}</p>
-              </article>
-            ))}
           </div>
         )}
       </section>
-        </>
-      )}
     </section>
   );
 }
@@ -887,22 +452,4 @@ function renderInline(text: string): ReactNode[] {
 
     return <em key={index}>{renderInline(part.slice(1, -1))}</em>;
   });
-}
-
-function SummarySection({ title, items }: { title: string; items: string[] }) {
-  return (
-    <article className="summary-section">
-      <h2>{title}</h2>
-      <ul>
-        {items.map((item) => (
-          <li key={item}>{item}</li>
-        ))}
-      </ul>
-    </article>
-  );
-}
-
-function pickMimeType(): string | undefined {
-  const preferred = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
-  return preferred.find((type) => MediaRecorder.isTypeSupported(type));
 }

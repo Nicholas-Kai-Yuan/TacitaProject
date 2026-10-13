@@ -21,6 +21,11 @@ const AGENT_SYSTEM_PROMPT = readFileSync(
   path.join(__dirname, "prompts", "silent-whisperer.md"),
   "utf-8",
 );
+// The tool's hidden first user prompt; it produces the welcome message.
+const FIRST_MESSAGE_PROMPT = readFileSync(
+  path.join(__dirname, "prompts", "first-message.md"),
+  "utf-8",
+);
 
 const KNOWLEDGE_AUDIT_CATEGORIES = [
   "Past & Future",
@@ -118,7 +123,7 @@ function requireOpenAiKey(): void {
 }
 
 function getModel(): string {
-  return process.env.OPENAI_MODEL?.trim() || "gpt-6-sol";
+  return process.env.OPENAI_MODEL?.trim() || "gpt-6-luna";
 }
 
 // Reasoning models think before answering; a lower effort keeps replies quick during the live interview.
@@ -126,11 +131,16 @@ function modelSettings() {
   const reasoningEffort = process.env.OPENAI_REASONING_EFFORT?.trim();
   return {
     model: openai(getModel()),
+    maxOutputTokens: Number(process.env.OPENAI_MAX_OUTPUT_TOKENS) || 10000,
     providerOptions: reasoningEffort ? { openai: { reasoningEffort } } : undefined,
   };
 }
 
 function buildSystemPrompt(setting: InterviewSetting): string {
+  return fillSettingFields(AGENT_SYSTEM_PROMPT, setting);
+}
+
+function fillSettingFields(template: string, setting: InterviewSetting): string {
   const fields: Record<string, string> = {
     field1: setting.interviewerName,
     field2: setting.smeName,
@@ -142,7 +152,7 @@ function buildSystemPrompt(setting: InterviewSetting): string {
     field8: setting.actaRatio,
   };
 
-  return AGENT_SYSTEM_PROMPT.split("\n")
+  return template.split("\n")
     .map((line) => {
       const inTableRow = line.trimStart().startsWith("|");
       return line.replace(/\{(field[1-8])\}/g, (_match, key: string) =>
@@ -187,7 +197,7 @@ export async function generateWelcomeReply(setting: InterviewSetting): Promise<s
   const result = await generateText({
     ...modelSettings(),
     system: buildSystemPrompt(setting),
-    prompt: "Begin the session now, following your Session Start Instruction exactly.",
+    prompt: fillSettingFields(FIRST_MESSAGE_PROMPT, setting),
   });
 
   return result.text;
@@ -210,18 +220,40 @@ export async function generateChatReply(
   const checklistShown = history.some((message) => message.role === "assistant" && message.content.includes("Expected Themes"));
   const earlyFunnel = queueDue && checklistShown ? settleFunnel(generateQuestionFunnel(setting, conversation)) : null;
 
-  const result = await generateText({
-    ...modelSettings(),
-    system: buildSystemPrompt(setting),
-    messages: toModelMessages(conversation),
-  });
+  const tracking = sessionTracking(conversation);
+  const system = tracking ? `${buildSystemPrompt(setting)}\n\n${tracking}` : buildSystemPrompt(setting);
+  let reply = await generateReplyText(system, conversation);
 
-  let reply = result.text;
   if (queueDue && readQueueTable(reply)) {
     const questions = await (earlyFunnel ?? settleFunnel(generateQuestionFunnel(setting, conversation)));
-    reply = questions ? replaceQueueTable(reply, questions) : reply;
+    return questions ? replaceQueueTable(reply, questions) : reply;
   }
-  return enforceQuestionQueue(reply, history, userMessage);
+
+  const repeats = repeatedFollowUps(reply, conversation);
+  if (repeats.length) {
+    console.info("Follow-ups repeated earlier questions; regenerating the reply.", repeats);
+    reply = await generateReplyText(
+      [
+        system,
+        "---",
+        "**SYSTEM CHECK: REPEATED FOLLOW-UPS**",
+        "A draft of this reply suggested follow-ups that repeat a starter question, a question already asked, or a follow-up already suggested:",
+        ...repeats.map((repeat) => `- ${repeat}`),
+        "Write the reply again with follow-ups that each take a new angle on what the SME just said (Step 3, Rule 7).",
+      ].join("\n\n"),
+      conversation,
+    );
+  }
+  return reply;
+}
+
+async function generateReplyText(system: string, conversation: ChatMessage[]): Promise<string> {
+  const result = await generateText({
+    ...modelSettings(),
+    system,
+    messages: toModelMessages(conversation),
+  });
+  return result.text;
 }
 
 type FunnelQuestion = Pick<StarterQuestion, "text" | "actaLevel" | "focus">;
@@ -240,7 +272,7 @@ async function generateQuestionFunnel(
       buildSystemPrompt(setting),
       "---",
       "**SYSTEM REQUEST: STEP 2.1 QUESTION QUEUE**",
-      "This request comes from the Tacita system, not the interviewer, so the Session Start Instruction and the confirmation gates do not apply to it.",
+      "This request comes from the Tacita system, not the interviewer, so the welcome message and the confirmation gates do not apply to it.",
       `Return the Step 2.1 Initial Question Queue as structured data with exactly ${counts.L1} L1, ${counts.L2} L2 and ${counts.L3} L3 questions.`,
       "Fill the blueprint first from the setup inputs, plus the Pre-Interview Checklist and any changes the interviewer asked for if the conversation has them, then write every question from it, following the Step 2.1 rules and the Question Depth & Grounding Standard.",
     ].join("\n\n"),
@@ -463,72 +495,120 @@ interface QueueTable {
   rows: QueueRow[];
 }
 
-// The model redraws the "15-Q Funnel" table every turn and, left alone, reshuffles rows, drops answered ones,
-// or swaps in follow-ups. Once the live interview starts (first reply with a SESSION TRACKER) every reply
-// gets the approved queue back, with statuses worked out from the transcripts.
-function enforceQuestionQueue(reply: string, history: ChatMessage[], latestMessage: string): string {
-  const lines = reply.split(/\r?\n/);
-  const range = findQueueTable(lines);
-  const now = Date.now();
-  const messages: ChatMessage[] = [
-    ...history,
-    { id: "latest", role: "user", content: latestMessage, createdAt: now },
-    { id: "reply", role: "assistant", content: reply, createdAt: now },
-  ];
-  const approved = approvedQueue(messages);
-  if (!range || !approved) {
-    return reply;
-  }
-
-  // Every transcript since the approved queue counts, so an answer sent before the first tracker is
-  // included and Done never reverts.
-  const transcripts = messages
-    .slice(approved.index + 1)
-    .filter((message) => message.role === "user")
-    .map((message) => message.content);
-  const activeQuestion = readQueueTable(reply)?.rows.find((row) => /active/i.test(row.cells.at(-1) ?? ""))?.question;
-
-  const rows = approved.table.rows.map((row) => {
-    let status = "Pending";
-    if (transcripts.some((transcript) => phraseOverlap(row.question, transcript) >= ASKED_THRESHOLD)) {
-      status = "Done";
-    } else if (activeQuestion && phraseOverlap(row.question, activeQuestion) >= ASKED_THRESHOLD) {
-      status = "Active";
-    }
-    return `| ${[...row.cells.slice(0, -1), status].join(" | ")} |`;
-  });
-
-  return [...lines.slice(0, range.start), ...approved.table.header, ...rows, ...lines.slice(range.end)].join("\n");
+// The queue is only shown while it is reviewed, so the most recent one is the approved queue.
+function referenceQueue(history: ChatMessage[]): QueueRow[] {
+  const latest = [...history].reverse().find((message) => message.role === "assistant" && readQueueTable(message.content));
+  return latest ? readQueueTable(latest.content)?.rows ?? [] : [];
 }
 
-// Null until the live interview has started. The approved queue is the last one shown before the first
-// SESSION TRACKER, or that message's own queue when the model went straight to the live format.
-function approvedQueue(messages: ChatMessage[]): { index: number; table: QueueTable } | null {
-  const liveIndex = messages.findIndex(
-    (message) => message.role === "assistant" && message.content.includes("SESSION TRACKER") && readQueueTable(message.content),
-  );
-  if (liveIndex < 0) {
+// Messages sent after the queue first appeared; review requests never contain answers, so they are harmless.
+function transcriptsSinceQueue(messages: ChatMessage[]): string[] {
+  const firstQueue = messages.findIndex((message) => message.role === "assistant" && readQueueTable(message.content));
+  return firstQueue < 0
+    ? []
+    : messages.slice(firstQueue + 1).filter((message) => message.role === "user").map((message) => message.content);
+}
+
+type StarterStatus = "Answered" | "Asked, awaiting answer" | "Pending";
+
+// Starter statuses and earlier suggestions, appended to the system prompt so the model tracks the queue without
+// showing it and avoids repeating questions (Step 3, Rules 7 and 8).
+function sessionTracking(conversation: ChatMessage[]): string | null {
+  const rows = referenceQueue(conversation);
+  if (!rows.length) {
     return null;
   }
 
-  for (let index = liveIndex - 1; index >= 0; index -= 1) {
-    const table = messages[index].role === "assistant" ? readQueueTable(messages[index].content) : null;
-    if (table) {
-      return { index, table };
-    }
-  }
-  const table = readQueueTable(messages[liveIndex].content);
-  return table ? { index: liveIndex, table } : null;
+  const transcripts = transcriptsSinceQueue(conversation);
+  const suggested = suggestedFollowUps(conversation.filter((message) => message.role === "assistant"));
+  return [
+    "---",
+    "**INTERNAL SESSION TRACKING (computed by the system from the submitted transcripts; never display it)**",
+    "Starter questions in the Initial Question Queue:",
+    ...rows.map((row) => `${row.cells[0]}. [${starterStatus(row.question, transcripts)}] ${row.question}`),
+    "Follow-ups already suggested:",
+    ...(suggested.length ? suggested.map((question) => `- ${question}`) : ["- None yet."]),
+  ].join("\n");
 }
 
-// The approved queue if the interview has started, otherwise the most recent queue shown.
-function referenceQueue(history: ChatMessage[]): QueueRow[] {
-  const approved = approvedQueue(history);
-  if (approved) {
-    return approved.table.rows;
+// Asked alone, a question stays unanswered; the SME's reply may follow it in the same message or arrive in the next one.
+export function starterStatus(question: string, transcripts: string[]): StarterStatus {
+  let status: StarterStatus = "Pending";
+  transcripts.forEach((transcript, index) => {
+    const after = textAfterQuestion(question, transcript);
+    if (after === null || status === "Answered") {
+      return;
+    }
+    // A next message that asks something is the interviewer moving on, not the SME answering.
+    const next = transcripts[index + 1];
+    const answeredNext = next !== undefined && !next.includes("?") && isSubstantiveAnswer(next);
+    status = isSubstantiveAnswer(after) || answeredNext ? "Answered" : "Asked, awaiting answer";
+  });
+  return status;
+}
+
+// The text following the densest run of the question's word pairs, or null if the question was not asked.
+function textAfterQuestion(question: string, text: string): string | null {
+  if (phraseOverlap(question, text) < ASKED_THRESHOLD) {
+    return null;
   }
-  const latest = [...history].reverse().find((message) => message.role === "assistant" && readQueueTable(message.content));
-  return latest ? readQueueTable(latest.content)?.rows ?? [] : [];
+
+  const pairs = new Set(wordPairs(question));
+  const words = [...text.matchAll(/[a-z0-9']+/gi)];
+  const matched = words
+    .slice(1)
+    .map((word, index) => (pairs.has(`${words[index][0]} ${word[0]}`.toLowerCase()) ? index : -1))
+    .filter((index) => index >= 0);
+
+  let best: number[] = [];
+  let run: number[] = [];
+  for (const index of matched) {
+    run = index - (run.at(-1) ?? index) > 3 ? [index] : [...run, index];
+    best = run.length > best.length ? run : best;
+  }
+  const lastWord = words[(best.at(-1) ?? 0) + 1];
+  return text.slice((lastWord.index ?? 0) + lastWord[0].length);
+}
+
+const MIN_ANSWER_WORDS = 5;
+
+// Speaker labels and further questions do not count as an answer.
+function isSubstantiveAnswer(text: string): boolean {
+  const statements = text
+    .replace(/^[^\S\n]*[^\n:?.!]{1,40}:/gm, " ")
+    .split(/(?<=[.!?])\s+/)
+    .filter((sentence) => !sentence.trim().endsWith("?"));
+  return (statements.join(" ").match(/[a-z0-9']+/gi)?.length ?? 0) >= MIN_ANSWER_WORDS;
+}
+
+// New follow-ups that repeat a starter question, a question already asked, an earlier suggestion, or each other.
+function repeatedFollowUps(reply: string, conversation: ChatMessage[]): string[] {
+  const fresh = suggestedFollowUps([{ id: "reply", role: "assistant", content: reply, createdAt: Date.now() }]);
+  if (!fresh.length) {
+    return [];
+  }
+
+  const askedQuestions = transcriptsSinceQueue(conversation).flatMap((transcript) =>
+    transcript.split(/(?<=[.!?])\s+/).filter((sentence) => sentence.trim().endsWith("?")),
+  );
+  const existing = [
+    ...referenceQueue(conversation).map((row) => row.question),
+    ...askedQuestions,
+    ...suggestedFollowUps(conversation.filter((message) => message.role === "assistant")),
+  ];
+  return fresh.filter(
+    (candidate, index) =>
+      existing.some((question) => isRepeatQuestion(candidate, question)) ||
+      fresh.slice(0, index).some((question) => isRepeatQuestion(candidate, question)),
+  );
+}
+
+// Near-verbatim repeats and light rewordings; deeper overlap is left to the No-Overlap Check in the prompt.
+export function isRepeatQuestion(a: string, b: string): boolean {
+  const aWords = contentWords(a);
+  const bWords = contentWords(b);
+  const shared = [...aWords].filter((word) => bWords.has(word)).length;
+  return (shared >= 3 && shared / Math.min(aWords.size, bWords.size) >= 0.7) || phraseOverlap(a, b) >= ASKED_THRESHOLD;
 }
 
 function readQueueTable(content: string): QueueTable | null {

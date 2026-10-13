@@ -251,7 +251,7 @@ main {
 .field input,
 .field textarea,
 .field select,
-.chat-form input {
+.chat-form textarea {
   width: 100%;
   border: 1px solid #d8e3ea;
   border-radius: 7px;
@@ -264,10 +264,18 @@ main {
 }
 
 .field input,
-.field select,
-.chat-form input {
+.field select {
   min-height: 44px;
   padding: 0 12px;
+}
+
+.chat-form textarea {
+  max-height: 40vh;
+  padding: 10px 12px;
+  overflow-y: auto;
+  font: inherit;
+  line-height: 1.45;
+  resize: none;
 }
 
 .field textarea {
@@ -279,7 +287,7 @@ main {
 .field input:focus,
 .field textarea:focus,
 .field select:focus,
-.chat-form input:focus {
+.chat-form textarea:focus {
   border-color: var(--teal);
   box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.12);
 }
@@ -958,6 +966,7 @@ button:disabled {
 }
 
 .chat-form {
+  align-items: flex-end;
   gap: 8px;
   margin-top: 14px;
 }
@@ -970,6 +979,35 @@ button:disabled {
 
 .summary-section {
   padding: 16px;
+}
+
+.section-heading .muted-line {
+  margin: 8px 0 0;
+}
+
+.tool-instructions {
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--teal-soft);
+  color: var(--ink);
+  line-height: 1.45;
+}
+
+.tool-instructions h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.tool-instructions p {
+  margin: 0 0 8px;
+}
+
+.tool-instructions ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 18px;
 }
 
 .summary-section h2 {

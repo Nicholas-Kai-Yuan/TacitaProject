@@ -3,7 +3,8 @@ import type { ActaLevel, ActaRatio } from "./types";
 const ACTA_LEVELS: ActaLevel[] = ["L1", "L2", "L3"];
 
 export function parseActaRatio(value: string): ActaRatio | null {
-  const matches = [...value.matchAll(/L\s*([123])\s*[:=-]?\s*(\d+(?:\.\d+)?)\s*%?/gi)];
+  // A level name may sit between the label and its number, e.g. "L3 Simulation: 20%".
+  const matches = [...value.matchAll(/L\s*([123])\b\D*?(\d+(?:\.\d+)?)\s*%?/gi)];
 
   if (matches.length >= 3) {
     const ratio = { L1: 0, L2: 0, L3: 0 };

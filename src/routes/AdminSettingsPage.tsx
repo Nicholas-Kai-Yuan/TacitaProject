@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { FilePlus2, Pencil, Save, Trash2, X } from "lucide-react";
 import { api } from "../api/client";
 import EmptyState from "../components/EmptyState";
+import ToolInstructions from "../components/ToolInstructions";
 import type { Account, InterviewSetting, InterviewSettingInput } from "../../shared/types";
 import { interviewSettingInputSchema } from "../../shared/validation";
 
@@ -23,6 +24,7 @@ const fields: Array<{
   key: SettingFieldKey;
   label: string;
   hint: string;
+  example?: string;
   multiline?: boolean;
 }> = [
   {
@@ -48,25 +50,27 @@ const fields: Array<{
   {
     key: "jobDescription",
     label: "Job Description",
-    hint: "Describe the SME's roles and key responsibilities.",
+    hint: "Describe the SME's roles and key responsibilities. More detailed descriptions help Tacita generate more relevant and targeted interview questions.",
     multiline: true,
   },
   {
     key: "interviewObjective",
     label: "Interview Objective and Purpose",
-    hint: "Describe the overall purpose of the interview and how the insights will be used.",
+    hint: "Describe the overall purpose of the interview, including the expert knowledge or decision-making you want to capture and how the insights will be used.",
+    example:
+      "E.g. [ This interview aims to capture the tacit knowledge, critical decision-making, and expert reasoning used by [SME Job Title]. The insights will be used to [state the purpose, e.g., develop training resources, support successor development, or optimise operational processes].",
     multiline: true,
   },
   {
     key: "keyFocusAreas",
     label: "Key Focus Areas",
-    hint: "Describe the specific areas of expertise, processes, decisions, challenges, or knowledge to explore.",
+    hint: "Describe the specific area of expertise, including the key processes, decisions, challenges, or knowledge you want the interview to explore. More specific descriptions help Tacita generate more relevant and targeted interview questions.",
     multiline: true,
   },
   {
     key: "actaRatio",
     label: "Desired Applied Cognitive Task Analysis (ACTA) Ratio",
-    hint: "Suggestion - L1: 20%; L2: 60%; L3: 20%",
+    hint: "[Suggestion – L1: 20%; L2: 60%; L3 Simulation: 20%]",
     multiline: true,
   },
 ];
@@ -200,10 +204,12 @@ export default function AdminSettingsPage() {
         </div>
 
         <form className="settings-form" onSubmit={handleSubmit}>
+          <ToolInstructions />
           {fields.map((field) => (
             <label className="field" key={field.key}>
               <span>{field.label}</span>
               <small>{field.hint}</small>
+              {field.example && <small>{field.example}</small>}
               {field.multiline ? (
                 <textarea
                   value={form[field.key]}
