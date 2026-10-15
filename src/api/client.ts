@@ -15,12 +15,12 @@ const apiBase = import.meta.env.VITE_API_BASE ?? "";
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`${apiBase}${path}`, {
+    ...options,
     headers: {
       "Content-Type": "application/json",
       ...getAuthHeader(),
       ...options.headers,
     },
-    ...options,
   });
 
   if (!response.ok) {
@@ -127,6 +127,12 @@ export const api = {
     request<InterviewSession & { chatMessages: ChatMessage[] }>(`/api/sessions/${sessionId}/chat`, {
       method: "POST",
       body: JSON.stringify({ message }),
+    }),
+  transcribe: (sessionId: string, audio: Blob) =>
+    request<{ text: string }>(`/api/sessions/${sessionId}/transcribe`, {
+      method: "POST",
+      headers: { "Content-Type": audio.type || "application/octet-stream" },
+      body: audio,
     }),
   endSession: (id: string) =>
     request<InterviewSession>(`/api/sessions/${id}/end`, {

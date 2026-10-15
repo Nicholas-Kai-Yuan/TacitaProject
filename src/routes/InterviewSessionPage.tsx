@@ -1,6 +1,6 @@
 import { FormEvent, Fragment, type KeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { MessageSquareText, Mic, Send } from "lucide-react";
+import { Loader2, MessageSquareText, Mic, Send, Square } from "lucide-react";
 import { api } from "../api/client";
 import { chatThreadTitle } from "../tacitaTool";
 import type { InterviewSession } from "../../shared/types";
@@ -14,6 +14,8 @@ export default function InterviewSessionPage() {
   const [chatMessage, setChatMessage] = useState("");
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const [recording, setRecording] = useState<"idle" | "recording" | "transcribing">("idle");
+  const recorderRef = useRef<MediaRecorder | null>(null);
 
   useEffect(() => {
     if (sessionId) {
@@ -24,6 +26,19 @@ export default function InterviewSessionPage() {
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [session?.chatMessages.length]);
+
+  // Release the microphone if the page closes mid-recording.
+  useEffect(
+    () => () => {
+      const recorder = recorderRef.current;
+      if (recorder && recorder.state !== "inactive") {
+        recorder.onstop = null;
+        recorder.stop();
+      }
+      recorder?.stream.getTracks().forEach((track) => track.stop());
+    },
+    [],
+  );
 
   // The input grows with its text; CSS sets the starting height and the cap.
   useEffect(() => {
@@ -76,6 +91,65 @@ export default function InterviewSessionPage() {
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
       event.currentTarget.form?.requestSubmit();
+    }
+  }
+
+  function toggleRecording() {
+    if (recording === "recording") {
+      recorderRef.current?.stop();
+    } else if (recording === "idle") {
+      void startRecording();
+    }
+  }
+
+  async function startRecording() {
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setError("This browser cannot record audio.");
+      return;
+    }
+
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream, { mimeType: pickAudioMimeType() });
+      const chunks: Blob[] = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunks.push(event.data);
+        }
+      };
+      recorder.onstop = () => {
+        stream.getTracks().forEach((track) => track.stop());
+        void transcribeRecording(new Blob(chunks, { type: recorder.mimeType }));
+      };
+      recorderRef.current = recorder;
+      recorder.start();
+      setRecording("recording");
+    } catch (micError) {
+      setError(micError instanceof Error ? `Microphone unavailable: ${micError.message}` : "Microphone unavailable");
+    }
+  }
+
+  // The transcript is added to the reply box for review rather than sent straight away.
+  async function transcribeRecording(audio: Blob) {
+    if (!session) {
+      return;
+    }
+
+    setRecording("transcribing");
+    try {
+      const { text } = await api.transcribe(session.id, audio);
+      if (text) {
+        setChatMessage((current) => (current.trim() ? `${current.trimEnd()}
+${text}` : text));
+        chatInputRef.current?.focus();
+      } else {
+        setError("No speech was detected in the recording.");
+      }
+    } catch (transcribeError) {
+      setError(transcribeError instanceof Error ? transcribeError.message : "Transcription failed");
+    } finally {
+      setRecording("idle");
     }
   }
 
@@ -149,9 +223,21 @@ export default function InterviewSessionPage() {
             onChange={(event) => setChatMessage(event.target.value)}
             onKeyDown={handleChatKeyDown}
             rows={4}
-            placeholder={session.status === "ended" ? "Interview ended" : "Proceed, Mic On, transcript, or End"}
+            placeholder={chatPlaceholder(session.status === "ended", recording)}
             disabled={session.status === "ended" || busy === "chat"}
           />
+          <button
+            className={`icon-button mic-button${recording === "recording" ? " recording" : ""}`}
+            type="button"
+            onClick={toggleRecording}
+            disabled={recording === "transcribing" || session.status === "ended"}
+            title={MIC_BUTTON_LABELS[recording]}
+            aria-label={MIC_BUTTON_LABELS[recording]}
+          >
+            {recording === "recording" && <Square size={16} />}
+            {recording === "transcribing" && <Loader2 className="spin" size={18} />}
+            {recording === "idle" && <Mic size={18} />}
+          </button>
           <button
             className="icon-button solid"
             type="submit"
@@ -178,6 +264,27 @@ export default function InterviewSessionPage() {
       </section>
     </section>
   );
+}
+
+const MIC_BUTTON_LABELS = {
+  idle: "Record",
+  recording: "Stop recording and transcribe",
+  transcribing: "Transcribing...",
+};
+
+function chatPlaceholder(ended: boolean, recording: keyof typeof MIC_BUTTON_LABELS): string {
+  if (ended) {
+    return "Interview ended";
+  }
+  if (recording === "recording") {
+    return "Recording... click stop to transcribe";
+  }
+  return recording === "transcribing" ? "Transcribing recording..." : "Proceed, Mic On, transcript, or End";
+}
+
+function pickAudioMimeType(): string | undefined {
+  const preferred = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+  return preferred.find((type) => MediaRecorder.isTypeSupported(type));
 }
 
 interface ListItem {

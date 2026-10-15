@@ -47,6 +47,7 @@ import {
   updateSetting,
   updateSettingAccess,
 } from "./store";
+import { transcribeRecording } from "./transcription";
 import {
   chatInputSchema,
   interviewSettingInputSchema,
@@ -421,6 +422,36 @@ app.post("/api/sessions/:id/chat", requireRole("interviewer"), async (request, r
   }
 });
 
+// Raw audio from the chat's mic button; 25 MB is OpenAI's upload limit.
+app.post(
+  "/api/sessions/:id/transcribe",
+  requireRole("interviewer"),
+  express.raw({ type: ["audio/*", "video/webm", "application/octet-stream"], limit: "25mb" }),
+  async (request, response, next) => {
+    try {
+      const auth = getAuth(response);
+      const session = await getSession(routeParam(request, "id"), auth.accountId);
+      if (!session) {
+        response.status(404).json({ error: "Interview session not found" });
+        return;
+      }
+
+      if (!Buffer.isBuffer(request.body) || request.body.length === 0) {
+        response.status(400).json({ error: "No audio was received" });
+        return;
+      }
+
+      try {
+        response.json({ text: await transcribeRecording(new Uint8Array(request.body), session.settingSnapshot) });
+      } catch (aiError) {
+        response.status(502).json({ error: describeAiError(aiError) });
+      }
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
 app.post("/api/sessions/:id/end", requireRole("interviewer"), async (request, response, next) => {
   try {
     const auth = getAuth(response);
@@ -519,6 +550,11 @@ websocket.on("message", async (message) => {
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
   if (error && typeof error === "object" && "issues" in error) {
     response.status(400).json({ error: "Validation failed", details: error });
+    return;
+  }
+
+  if (error && typeof error === "object" && "type" in error && error.type === "entity.too.large") {
+    response.status(413).json({ error: "The recording is too long to transcribe. Record a shorter segment." });
     return;
   }
 
